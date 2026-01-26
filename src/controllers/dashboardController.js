@@ -1,5 +1,6 @@
 const { pool } = require('../config/db');
 const Task = require('../models/taskModel');
+const { getUserStage, getNextStage, getStageRecommendations } = require('../services/stageService');
 
 // Helper: Calculate comprehensive profile strength
 const calculateProfileStrength = (profile) => {
