@@ -17,6 +17,7 @@ app.use('/api/tasks', require('./src/routes/taskRoutes'));
 app.use('/api/ai', require('./src/routes/aiRoutes')); 
 app.use('/api/recommendations', require('./src/routes/recommendationRoutes'));
 app.use('/api/dashboard', require('./src/routes/dashboardRoutes'));
+app.use('/api/universities', require('./src/routes/universityRoutes'));
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
