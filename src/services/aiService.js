@@ -3,58 +3,102 @@ require('dotenv').config();
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-// A. Chat with Counsellor (Used in aiController)
+// Generate chat response with profile context
 const generateChatResponse = async (userProfile, userMessage) => {
   const systemPrompt = `
     You are an expert Study Abroad Counsellor.
     User Profile: ${JSON.stringify(userProfile)}
     
     Be helpful, realistic, and concise. 
-    If the budget is low, suggest affordable countries (Germany, Italy).
-    If GPA is low, suggest "Safe" universities.
+    - If budget is low, suggest affordable countries (Germany, Norway, scholarships)
+    - If GPA is low, suggest "Safe" universities
+    - Be honest about chances
+    - Provide actionable advice
   `;
 
-  const completion = await groq.chat.completions.create({
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userMessage }
-    ],
-    model: "llama3-8b-8192",
-  });
+  try {
+    const completion = await groq.chat.completions.create({
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userMessage }
+      ],
+      model: "llama3-70b-8192",
+      temperature: 0.7
+    });
 
-  return completion.choices[0].message.content;
+    return completion.choices[0].message.content;
+  } catch (err) {
+    console.error("AI chat error:", err);
+    throw new Error("Failed to generate AI response");
+  }
 };
 
-// B. Data Enrichment (Used in universityService)
+// Generate university recommendations
+const generateRecommendations = async (profile) => {
+  try {
+    if (!profile.gpa || !profile.preferred_countries || !profile.field_of_study) {
+      return { dream: [], target: [], safe: [] };
+    }
+
+    const prompt = `
+      Student Profile:
+      - GPA: ${profile.gpa}/${profile.gpa_scale || 4.0}
+      - Budget: $${profile.budget_range_min}-${profile.budget_range_max}/year
+      - Countries: ${profile.preferred_countries?.join(", ")}
+      - Field: ${profile.field_of_study}
+      - Degree: ${profile.intended_degree}
+      
+      Generate realistic university recommendations in 3 categories (Dream, Target, Safe).
+      Each university needs: name, location, acceptance_rate
+      
+      Output JSON:
+      {
+        "dream": [{name, location, acceptance_rate}],
+        "target": [{name, location, acceptance_rate}],
+        "safe": [{name, location, acceptance_rate}]
+      }
+    `;
+
+    const completion = await groq.chat.completions.create({
+      messages: [{ role: "user", content: prompt }],
+      model: "llama3-70b-8192",
+      response_format: { type: "json_object" },
+      temperature: 0.7
+    });
+
+    return JSON.parse(completion.choices[0].message.content);
+  } catch (error) {
+    console.error("Recommendations generation error:", error);
+    return { dream: [], target: [], safe: [] };
+  }
+};
+
+// Enrich university data with additional details
 const enrichUniversityData = async (uniList) => {
+  if (!uniList || uniList.length === 0) return [];
+
   const uniNames = uniList.map(u => u.name).join(", ");
-  
+
   try {
     const completion = await groq.chat.completions.create({
       messages: [
         {
           role: "system",
-          content: `You are a database. I will give you university names.
-          Return a JSON OBJECT with a key "data" containing an array.
-          Each object must have:
-          - name (exact match)
-          - global_ranking (approx number)
-          - tuition_fees (approx USD/year)
-          - acceptance_rate (approx %)
-          
-          OUTPUT JSON ONLY. NO TEXT.`
+          content: `You are a university data expert. Return JSON with university details.
+          Format: {"data": [{"name": "...", "global_ranking": 123, "tuition_fees": "...", "acceptance_rate": "..."}]}`
         },
         { role: "user", content: `Universities: ${uniNames}` }
       ],
-      model: "llama3-8b-8192",
-      response_format: { type: "json_object" }
+      model: "llama3-70b-8192",
+      response_format: { type: "json_object" },
+      temperature: 0.5
     });
 
     const aiData = JSON.parse(completion.choices[0].message.content);
-    
+
     // Merge AI data with original list
     return uniList.map(uni => {
-      const details = aiData.data?.find(d => d.name.includes(uni.name)) || {};
+      const details = aiData.data?.find(d => d.name?.includes(uni.name)) || {};
       return { ...uni, ...details };
     });
 
@@ -64,26 +108,55 @@ const enrichUniversityData = async (uniList) => {
   }
 };
 
-// C. Recommendations (Used in recommendationController)
-const generateRecommendations = async (profile) => {
+// Analyze profile and provide insights
+const analyzeProfile = async (profile) => {
   try {
     const prompt = `
-      User: GPA ${profile.gpa}, Budget ${profile.budget}, Country ${profile.country}, Major ${profile.degree}.
-      Generate 3 lists (Dream, Target, Safe) of universities.
-      Output JSON with keys: "dream", "target", "safe".
-      Include name, location, and acceptance_rate for each.
+      Analyze this student profile and provide honest feedback:
+      
+      - GPA: ${profile.gpa}/${profile.gpa_scale || 4.0}
+      - Field: ${profile.field_of_study}
+      - Target Degree: ${profile.intended_degree}
+      - Budget: $${profile.budget_range_min}-${profile.budget_range_max}
+      - Test Scores: IELTS ${profile.ielts_score || 'N/A'}, GRE ${profile.gre_score || 'N/A'}
+      - Work Experience: ${profile.work_experience_years || 0} years
+      
+      Provide:
+      1. Strength: What's strong about this profile
+      2. Weaknesses: What needs improvement
+      3. Recommendations: 3 specific action items
+      
+      Return JSON:
+      {
+        "strength": "...",
+        "weaknesses": ["...", "..."],
+        "recommendations": ["...", "...", "..."],
+        "competitiveness": "High/Medium/Low"
+      }
     `;
 
     const completion = await groq.chat.completions.create({
       messages: [{ role: "user", content: prompt }],
-      model: "llama3-8b-8192",
-      response_format: { type: "json_object" }
+      model: "llama3-70b-8192",
+      response_format: { type: "json_object" },
+      temperature: 0.6
     });
 
     return JSON.parse(completion.choices[0].message.content);
   } catch (error) {
-    return { dream: [], target: [], safe: [] };
+    console.error("Profile analysis error:", error);
+    return {
+      strength: "Unable to analyze",
+      weaknesses: [],
+      recommendations: [],
+      competitiveness: "Unknown"
+    };
   }
 };
 
-module.exports = { generateChatResponse, enrichUniversityData, generateRecommendations };
+module.exports = {
+  generateChatResponse,
+  enrichUniversityData,
+  generateRecommendations,
+  analyzeProfile
+};

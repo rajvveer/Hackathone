@@ -1,6 +1,11 @@
-const router = require('express').Router();
-const { getDashboardStats } = require('../controllers/dashboardController');
+const express = require('express');
+const router = express.Router();
 const { protect } = require('../middleware/authMiddleware');
+const { requireOnboarding } = require('../middleware/onboardingMiddleware');
+const { getDashboardStats } = require('../controllers/dashboardController');
 
-router.get('/', protect, getDashboardStats);
+// @route   GET /api/dashboard
+// @access  Private (requires onboarding)
+router.get('/', protect, requireOnboarding, getDashboardStats);
+
 module.exports = router;
