@@ -1,30 +1,33 @@
 const axios = require('axios');
-const { enrichUniversityData } = require('./aiService'); // We will build this next
+const { enrichUniversityData } = require('./aiService'); // Keeps your AI logic separate
 
-// 1. Fetch Raw List from Free API
-const fetchUniversityList = async (country, name) => {
-  try {
-    // Search by country and partial name
-    let url = `http://universities.hipolabs.com/search?country=${country}`;
-    if (name) url += `&name=${name}`;
+// Official API Endpoint from the documentation you shared
+const BASE_URL = 'http://universities.hipolabs.com/search';
 
-    const response = await axios.get(url);
-    // Limit to top 8 results to keep it fast for the demo
-    return response.data.slice(0, 8); 
-  } catch (error) {
-    console.error("API Error:", error.message);
-    return [];
-  }
-};
-
-// 2. The "Standout" Feature: Get Real + AI Data
 const searchUniversities = async (country, name) => {
-  const rawList = await fetchUniversityList(country, name);
-  if (rawList.length === 0) return [];
+  try {
+    const params = {};
+    if (country) params.country = country;
+    if (name) params.name = name;
 
-  // Pass the raw list to AI to "Fill in the blanks" (Fees, Acceptance Rate)
-  const enrichedList = await enrichUniversityData(rawList);
-  return enrichedList;
+    // 1. Get Raw Data from HipoLabs
+    const response = await axios.get(BASE_URL, { params });
+    let rawList = response.data;
+
+    // Safety: If API returns nothing, return empty array immediately
+    if (!rawList || rawList.length === 0) return [];
+
+    // Limit to top 10 results for speed (AI enrichment is slow)
+    rawList = rawList.slice(0, 10);
+
+    // 2. Enrich with AI (Rankings/Fees)
+    const enrichedList = await enrichUniversityData(rawList);
+    return enrichedList;
+
+  } catch (error) {
+    console.error("University API Error:", error.message);
+    return []; // Return empty array so frontend doesn't crash
+  }
 };
 
 module.exports = { searchUniversities };
