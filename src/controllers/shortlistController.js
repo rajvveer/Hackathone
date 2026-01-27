@@ -258,8 +258,8 @@ const lockUniversity = async (req, res) => {
       return res.status(404).json({ error: "Shortlist not found" });
     }
 
-    // Lock the university in database
-    await User.lockUniversity(req.user.id, shortlist_id);
+    // Lock the university in database and get updated user
+    const updatedUser = await User.lockUniversity(req.user.id, shortlist_id);
     await Shortlist.lock(shortlist_id);
 
     // Delete any existing AI-generated tasks
@@ -283,7 +283,15 @@ const lockUniversity = async (req, res) => {
         category: shortlist.category
       },
       tasks_generated: createdTasks.length,
-      next_steps: "Check your dashboard for personalized application tasks"
+      next_steps: "Check your dashboard for personalized application tasks",
+      user: {
+        id: updatedUser.id,
+        name: updatedUser.name,
+        email: updatedUser.email,
+        stage: updatedUser.stage,
+        locked_university_id: updatedUser.locked_university_id,
+        profile_data: updatedUser.profile_data
+      }
     });
 
   } catch (err) {
@@ -306,15 +314,23 @@ const unlockUniversity = async (req, res) => {
     // Delete all AI-generated tasks
     const deletedTasks = await Task.deleteAIGenerated(req.user.id);
 
-    // Unlock in database
-    await User.unlockUniversity(req.user.id);
+    // Unlock in database and get updated user
+    const updatedUser = await User.unlockUniversity(req.user.id);
     await Shortlist.unlock(req.user.locked_university_id);
 
     res.json({
       warning: "All application tasks have been deleted",
       message: "You can now lock a different university",
       previous_choice: locked.uni_name,
-      tasks_deleted: deletedTasks.length
+      tasks_deleted: deletedTasks.length,
+      user: {
+        id: updatedUser.id,
+        name: updatedUser.name,
+        email: updatedUser.email,
+        stage: updatedUser.stage,
+        locked_university_id: updatedUser.locked_university_id,
+        profile_data: updatedUser.profile_data
+      }
     });
 
   } catch (err) {

@@ -173,12 +173,15 @@ const updateProfile = async (req, res) => {
     // Update profile
     const updatedUser = await User.updateProfile(req.user.id, profileData);
 
+    // Get shortlists count for response
+    let shortlists = [];
+
     // If critical fields changed, invalidate recommendation cache
     if (changedFields.length > 0) {
       await RecommendationCache.invalidate(req.user.id);
 
       // Recalculate fit for existing shortlists
-      const shortlists = await Shortlist.findAllByUser(req.user.id);
+      shortlists = await Shortlist.findAllByUser(req.user.id);
       // Note: Actual recalculation would require AI call, skipping for now
     }
 
@@ -206,4 +209,29 @@ const updateProfile = async (req, res) => {
   }
 };
 
-module.exports = { getProfile, updateProfile };
+// @desc    Delete User Account
+// @route   DELETE /api/user/account
+const deleteAccount = async (req, res) => {
+  const userId = req.user.id;
+
+  try {
+    // Delete all user data in order (respecting foreign key constraints)
+    await pool.query('DELETE FROM tasks WHERE user_id = $1', [userId]);
+    await pool.query('DELETE FROM shortlists WHERE user_id = $1', [userId]);
+    await pool.query('DELETE FROM conversations WHERE user_id = $1', [userId]);
+    await pool.query('DELETE FROM user_recommendations WHERE user_id = $1', [userId]);
+
+    // Finally delete the user
+    await pool.query('DELETE FROM users WHERE id = $1', [userId]);
+
+    res.json({
+      message: "Account deleted successfully",
+      success: true
+    });
+  } catch (err) {
+    console.error("Delete account error:", err);
+    res.status(500).json({ error: 'Failed to delete account' });
+  }
+};
+
+module.exports = { getProfile, updateProfile, deleteAccount };

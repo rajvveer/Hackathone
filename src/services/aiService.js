@@ -22,7 +22,7 @@ const generateChatResponse = async (userProfile, userMessage) => {
         { role: "system", content: systemPrompt },
         { role: "user", content: userMessage }
       ],
-      model: "llama3-70b-8192",
+      model: "llama-3.3-70b-versatile",
       temperature: 0.7
     });
 
@@ -61,7 +61,7 @@ const generateRecommendations = async (profile) => {
 
     const completion = await groq.chat.completions.create({
       messages: [{ role: "user", content: prompt }],
-      model: "llama3-70b-8192",
+      model: "llama-3.3-70b-versatile",
       response_format: { type: "json_object" },
       temperature: 0.7
     });
@@ -89,7 +89,7 @@ const enrichUniversityData = async (uniList) => {
         },
         { role: "user", content: `Universities: ${uniNames}` }
       ],
-      model: "llama3-70b-8192",
+      model: "llama-3.3-70b-versatile",
       response_format: { type: "json_object" },
       temperature: 0.5
     });
@@ -137,7 +137,7 @@ const analyzeProfile = async (profile) => {
 
     const completion = await groq.chat.completions.create({
       messages: [{ role: "user", content: prompt }],
-      model: "llama3-70b-8192",
+      model: "llama-3.3-70b-versatile",
       response_format: { type: "json_object" },
       temperature: 0.6
     });

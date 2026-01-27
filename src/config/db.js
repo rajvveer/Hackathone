@@ -124,6 +124,7 @@ const runMigrations = async () => {
   const migrations = [
     // Users table enhancements
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN DEFAULT FALSE",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_university_id INT",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_at TIMESTAMP",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
 

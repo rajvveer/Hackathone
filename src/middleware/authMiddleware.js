@@ -14,7 +14,7 @@ const protect = async (req, res, next) => {
       const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret123');
 
       // Get user from token
-      const result = await pool.query('SELECT id, name, email, stage, profile_data FROM users WHERE id = $1', [decoded.id]);
+      const result = await pool.query('SELECT id, name, email, stage, profile_data, locked_university_id FROM users WHERE id = $1', [decoded.id]);
       req.user = result.rows[0];
 
       if (!req.user) {
