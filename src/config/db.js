@@ -5,7 +5,13 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL && process.env.DATABASE_URL.includes("localhost")
     ? false
-    : { rejectUnauthorized: false }
+    : { rejectUnauthorized: false },
+  // Performance optimizations for remote databases
+  max: 20, // Maximum connections in pool
+  idleTimeoutMillis: 30000, // Close idle connections after 30s
+  connectionTimeoutMillis: 5000, // Timeout for new connections
+  keepAlive: true, // Keep connections alive
+  keepAliveInitialDelayMillis: 10000
 });
 
 const connectDB = async () => {
