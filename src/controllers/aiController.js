@@ -338,6 +338,77 @@ const executeLockUniversity = async (userId, args, shortlist) => {
   }
 };
 
+// Helper: Execute profile update action
+const executeUpdateProfile = async (userId, currentProfile, args) => {
+  try {
+    const { field, value } = args;
+    const updatedProfile = { ...currentProfile };
+
+    // Handle different field types
+    switch (field) {
+      // Array fields (comma-separated)
+      case 'preferred_countries':
+        updatedProfile[field] = value.split(',').map(v => v.trim());
+        break;
+
+      // Numeric fields
+      case 'gpa':
+      case 'gpa_scale':
+      case 'ielts_score':
+      case 'toefl_score':
+      case 'gre_score':
+      case 'gmat_score':
+      case 'budget_range_min':
+      case 'budget_range_max':
+      case 'target_intake_year':
+      case 'work_experience_years':
+        updatedProfile[field] = parseFloat(value) || value;
+        break;
+
+      // Status fields
+      case 'ielts_status':
+      case 'toefl_status':
+      case 'gre_status':
+      case 'gmat_status':
+      case 'sop_status':
+        // Normalize status values
+        const normalizedStatus = value.toLowerCase().replace(/\s+/g, '-');
+        if (['not-started', 'in-progress', 'completed', 'ready', 'draft'].includes(normalizedStatus)) {
+          updatedProfile[field] = normalizedStatus;
+        } else {
+          updatedProfile[field] = value;
+        }
+        break;
+
+      // String fields
+      default:
+        updatedProfile[field] = value;
+        break;
+    }
+
+    // Keep onboarding completed status
+    updatedProfile.onboarding_completed = currentProfile.onboarding_completed || true;
+
+    // Update in database
+    const User = require('../models/userModel');
+    await User.updateProfile(userId, updatedProfile);
+
+    // Format field name for display
+    const displayField = field.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+
+    return {
+      success: true,
+      message: `Updated ${displayField} to "${value}"`
+    };
+  } catch (err) {
+    console.error("Update profile error:", err);
+    return {
+      success: false,
+      message: "Failed to update profile"
+    };
+  }
+};
+
 
 // @desc    Get conversation history
 // @route   GET /api/ai/conversation/:id
@@ -392,10 +463,28 @@ const streamChatWithCounsellor = async (req, res) => {
     const shortlist = shortlistResult || [];
     const lockedUni = shortlist.find(s => s.id === user.locked_university_id);
 
+    // Fetch user's tasks for progress context
+    const tasksResult = await Task.findAllByUser(user.id);
+    const tasks = tasksResult || [];
+    const completedTasks = tasks.filter(t => t.status === 'completed').length;
+    const totalTasks = tasks.length;
+    const taskProgress = totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : 0;
+    const pendingHighPriority = tasks.filter(t => t.status === 'pending' && t.priority === 'high');
+
     // Build shortlist context
     const shortlistContext = shortlist.length > 0
       ? `\n      Shortlisted Universities:\n      ${shortlist.map(s => `- ${s.uni_name} (${s.country}) - ${s.category}${s.id === user.locked_university_id ? ' [LOCKED]' : ''}`).join('\n      ')}`
       : '\n      No universities shortlisted yet.';
+
+    // Build task progress context
+    const taskContext = totalTasks > 0
+      ? `\n      Task Progress: ${completedTasks}/${totalTasks} tasks completed (${taskProgress}%)${taskProgress === 100
+        ? ' - ALL TASKS COMPLETE! User is ready to submit application.'
+        : pendingHighPriority.length > 0
+          ? `\n      High Priority Pending: ${pendingHighPriority.map(t => t.title).join(', ')}`
+          : ''
+      }`
+      : '\n      No tasks assigned yet.';
 
     // Build profile context
     const profile = user.profile_data || {};
@@ -417,6 +506,7 @@ const streamChatWithCounsellor = async (req, res) => {
       - SOP Status: ${profile.sop_status || "not started"}
       - Locked University: ${lockedUni ? lockedUni.uni_name : 'None'}
       ${shortlistContext}
+      ${taskContext}
     `;
 
     // Define tools (same as chatWithCounsellor)
@@ -496,6 +586,41 @@ const streamChatWithCounsellor = async (req, res) => {
             required: ["university_name"]
           }
         }
+      },
+      {
+        type: "function",
+        function: {
+          name: "update_profile",
+          description: "Update the user's profile information. Use this when user asks to update, change, or set any profile field like GPA, IELTS score, target countries, budget, etc.",
+          parameters: {
+            type: "object",
+            properties: {
+              field: {
+                type: "string",
+                enum: [
+                  "gpa", "gpa_scale",
+                  "ielts_status", "ielts_score",
+                  "toefl_status", "toefl_score",
+                  "gre_status", "gre_score",
+                  "gmat_status", "gmat_score",
+                  "sop_status",
+                  "preferred_countries",
+                  "budget_range_min", "budget_range_max",
+                  "target_intake_year", "target_intake_season",
+                  "intended_degree", "field_of_study",
+                  "current_education_level", "work_experience_years",
+                  "funding_plan"
+                ],
+                description: "The profile field to update"
+              },
+              value: {
+                type: "string",
+                description: "The new value for the field. For arrays like preferred_countries, use comma-separated values. For status fields use: not-started, in-progress, completed. For scores, use numeric values."
+              }
+            },
+            required: ["field", "value"]
+          }
+        }
       }
     ];
 
@@ -511,7 +636,7 @@ const streamChatWithCounsellor = async (req, res) => {
         
         Your role:
         - Provide realistic, honest advice about university admissions
-        - TAKE ACTIONS when the user asks you to (add tasks, shortlist universities, lock universities)
+        - TAKE ACTIONS when the user asks you to (add tasks, shortlist universities, lock universities, update profile)
         - Be proactive in suggesting next steps
         - Analyze if shortlisted universities are suitable and suggest locking the best one
         
@@ -520,14 +645,36 @@ const streamChatWithCounsellor = async (req, res) => {
         - If user says "shortlist", "add university", "add MIT" → USE shortlist_university tool
         - If user asks for recommendations → USE get_university_recommendations tool
         - If user says "lock", "commit to", "choose [university]", "finalize" → USE lock_university tool (ONLY if university is already shortlisted)
+        - ONLY use update_profile tool when user specifies BOTH the field AND the value clearly
+          - CORRECT: "update my GPA to 3.8" → USE update_profile(gpa, 3.8)
+          - CORRECT: "change my IELTS score to 7.5" → USE update_profile(ielts_score, 7.5)
+          - WRONG: "update my profile" → DO NOT USE TOOL, instead ASK "What would you like to update? (GPA, IELTS score, budget, etc.)"
+          - WRONG: "update my GPA" (no value) → DO NOT USE TOOL, instead ASK "What is your new GPA?"
+          - Can update: gpa, ielts_score, ielts_status, toefl_score, gre_score, preferred_countries, budget_range_min, budget_range_max, target_intake_year, intended_degree, field_of_study, sop_status, funding_plan
         
         ${profileContext}
         
-        When the user asks about their shortlist or which university to choose:
-        1. Review their shortlisted universities above
-        2. Give an honest assessment of each one's suitability
-        3. If one stands out, suggest they "lock" it to get application guidance
-        4. If the user has no universities shortlisted, suggest they shortlist some first
+        CONTEXT-AWARE GUIDANCE:
+        1. If task progress is 100% (ALL TASKS COMPLETE):
+           - Congratulate the user! They're ready to submit their application
+           - Guide them on: final application review, submission process, interview preparation
+           - Suggest post-submission steps: tracking status, visa preparation, accommodation research
+           
+        2. If task progress is high (70-99%):
+           - Focus on completing remaining high-priority tasks
+           - Encourage them - they're almost there!
+           
+        3. If user has locked a university:
+           - Focus advice on that specific university's requirements
+           - Help with application-specific questions
+           
+        4. If no university is locked yet:
+           - Help them choose and lock a university first
+           
+        When the user asks "what should I do next":
+        - Check their task progress above
+        - If 100% complete: guide on submission and next phase
+        - If not complete: highlight pending high-priority tasks
         
         Be conversational, helpful, and ACTION-ORIENTED. When you execute a tool, confirm what you did.
         Format responses with **bold** for emphasis, use bullet points for lists.`
@@ -617,6 +764,19 @@ const streamChatWithCounsellor = async (req, res) => {
             actions.push(actionData);
             res.write(`data: ${JSON.stringify({ type: 'action', ...actionData })}\n\n`);
             break;
+
+          case "update_profile":
+            result = await executeUpdateProfile(user.id, user.profile_data || {}, functionArgs);
+            actionData = {
+              action: "profile_updated",
+              field: functionArgs.field,
+              value: functionArgs.value,
+              success: result.success,
+              message: result.message
+            };
+            actions.push(actionData);
+            res.write(`data: ${JSON.stringify({ type: 'action', ...actionData })}\n\n`);
+            break;
         }
       }
     }
@@ -640,6 +800,8 @@ const streamChatWithCounsellor = async (req, res) => {
       const followUp = await groq.chat.completions.create({
         messages: toolResultMessages,
         model: "llama-3.3-70b-versatile",
+        tools,
+        tool_choice: "none", // Prevent AI from calling tools in follow-up
         temperature: 0.7,
         stream: true
       });
