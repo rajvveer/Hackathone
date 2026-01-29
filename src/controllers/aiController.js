@@ -120,6 +120,25 @@ const chatWithCounsellor = async (req, res) => {
             }
           }
         }
+      },
+      {
+        type: "function",
+        function: {
+          name: "set_task_status",
+          description: "Update the status of an existing task. REQUIRED for 'mark done', 'complete', 'finish'.",
+          parameters: {
+            type: "object",
+            properties: {
+              task_keyword: { type: "string", description: "A unique keyword or phrase from the task title to identify it" },
+              status: {
+                type: "string",
+                enum: ["completed", "pending"],
+                description: "The new status to set"
+              }
+            },
+            required: ["task_keyword", "status"]
+          }
+        }
       }
     ];
 
@@ -551,8 +570,8 @@ const clearConversation = async (req, res) => {
 // @route   POST /api/ai/chat/stream
 const streamChatWithCounsellor = async (req, res) => {
   const { message, conversation_id } = req.body;
+
   // FORCE FRESH USER DATA FETCH
-  // Middleware req.user might be stale if multiple requests happen quickly
   const { pool } = require('../config/db');
   let user;
   try {
@@ -562,92 +581,78 @@ const streamChatWithCounsellor = async (req, res) => {
     user = req.user; // Fallback
   }
 
-  // Set up SSE headers
+  // Set up SSE headers - Critical for streaming
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no');
+  res.setHeader('X-Accel-Buffering', 'no'); // Disable Nginx buffering
   res.flushHeaders();
 
   try {
-    // PARALLEL CONTEXT FETCHING for performance
+    // OPTIMIZED: Reduce parallel fetching load
+    // We only fetch what is strictly necessary for the prompt
+    console.time("Context Fetch");
     const [conversation, shortlistResult, tasksResult] = await Promise.all([
       Conversation.getOrCreate(user.id),
       Shortlist.findAllByUser(user.id),
       Task.findAllByUser(user.id)
     ]);
+    console.timeEnd("Context Fetch");
 
-    // Process shortlist
+    // Process shortlist (Optimize: limited details)
     const shortlist = shortlistResult || [];
     const lockedUni = shortlist.find(s => s.id === user.locked_university_id);
+    // OPTIMIZATION: Limit shortlist context size
+    const shortlistSummary = shortlist.length > 0
+      ? shortlist.map(s => `${s.uni_name} (${s.category})`).join(', ')
+      : 'None';
 
-    // Process tasks
+    // Process tasks (Optimize: summary only, not full list)
     const tasks = tasksResult || [];
-    user.tasks = tasks; // Attach tasks to user object for tools to use
+    user.tasks = tasks; // Attach for tools
     const completedTasks = tasks.filter(t => t.status === 'completed').length;
     const totalTasks = tasks.length;
     const taskProgress = totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : 0;
-    const pendingHighPriority = tasks.filter(t => t.status === 'pending' && t.priority === 'high');
 
-    // Build shortlist context
-    const shortlistContext = shortlist.length > 0
-      ? `\n      Shortlisted Universities:\n      ${shortlist.map(s => `- ${s.uni_name} (${s.country}) - ${s.category}${s.id === user.locked_university_id ? ' [LOCKED]' : ''}`).join('\n      ')}`
-      : '\n      No universities shortlisted yet.';
+    // Only list high priority pending tasks to save tokens
+    const pendingHighPriority = tasks
+      .filter(t => t.status === 'pending' && t.priority === 'high')
+      .map(t => t.title)
+      .slice(0, 5); // Max 5 tasks
 
-    // Build task progress context
-    const taskContext = totalTasks > 0
-      ? `\n      Task Progress: ${completedTasks}/${totalTasks} tasks completed (${taskProgress}%)${taskProgress === 100
-        ? ' - ALL TASKS COMPLETE! User is ready to submit application.'
-        : `\n      Pending Tasks:\n      ${tasks.filter(t => t.status === 'pending').map(t => `- ${t.title} (${t.priority})`).join('\n      ')}`
-      }`
-      : '\n      No tasks assigned yet.';
+    // Build concise context strings
+    const shortlistContext = `Shortlist: ${shortlistSummary}${lockedUni ? `. Locked: ${lockedUni.uni_name}` : ''}`;
 
-    // Build profile context
+    let taskContext = `Tasks: ${completedTasks}/${totalTasks} done (${taskProgress}%).`;
+    if (pendingHighPriority.length > 0) {
+      taskContext += ` Priority: ${pendingHighPriority.join(', ')}`;
+    }
+
+    // Build profile text (Concise version)
     const profile = user.profile_data || {};
     const profileContext = `
-      User Profile:
-      - Name: ${user.name}
-      - Current Education: ${profile.current_education_level || "Not set"}
-      - Target Degree: ${profile.intended_degree || "Not set"}
-      - Field of Study: ${profile.field_of_study || "Not set"}
-      - GPA: ${profile.gpa || "Not set"}${profile.gpa_scale ? `/${profile.gpa_scale}` : ''}
-      - Budget: ${profile.budget_range_min && profile.budget_range_max ?
-        `$${profile.budget_range_min}-${profile.budget_range_max}/year` : "Not set"}
-      - Funding: ${profile.funding_plan || "Not set"}
-      - Countries: ${profile.preferred_countries?.join(", ") || "Not set"}
-      - Target Intake: ${profile.target_intake_season || 'Fall'} ${profile.target_intake_year || 'Not set'}
-      - Current Stage: ${user.stage} (1=Profile, 2=Discovery, 3=Shortlist, 4=Locked)
-      - IELTS: ${profile.ielts_status || "not started"}${profile.ielts_score ? ` (Score: ${profile.ielts_score})` : ''}
-      - GRE: ${profile.gre_status || "not started"}${profile.gre_score ? ` (Score: ${profile.gre_score})` : ''}
-      - SOP Status: ${profile.sop_status || "not started"}
-      - Locked University: ${lockedUni ? lockedUni.uni_name : 'None'}
+      Profile: ${user.name}, ${profile.intended_degree || "Degree?"} in ${profile.field_of_study || "Field?"}.
+      Stage: ${user.stage}/4. GPA: ${profile.gpa || "?"}. IELTS: ${profile.ielts_score || "?"}.
+      Budget: ${profile.budget_range_max || "?"}.
       ${shortlistContext}
       ${taskContext}
     `;
 
-    // Define tools (same as chatWithCounsellor)
+    // Define tools (kept same)
     const tools = [
       {
         type: "function",
         function: {
           name: "shortlist_university",
-          description: "Add a university to the user's shortlist with category (Dream/Target/Safe). Use this when the user asks you to shortlist or add a university.",
+          description: "Add a university to the user's shortlist with category (Dream/Target/Safe).",
           parameters: {
             type: "object",
             properties: {
-              university_name: { type: "string", description: "Full name of the university" },
-              country: { type: "string", description: "Country where university is located" },
-              category: {
-                type: "string",
-                enum: ["Dream", "Target", "Safe"],
-                description: "Match category based on user's profile"
-              },
-              why_fits: { type: "string", description: "2-3 sentence explanation of why this fits the user" },
-              acceptance_chance: {
-                type: "string",
-                enum: ["Low", "Medium", "High"],
-                description: "Realistic acceptance chance for this user"
-              }
+              university_name: { type: "string" },
+              country: { type: "string" },
+              category: { type: "string", enum: ["Dream", "Target", "Safe"] },
+              why_fits: { type: "string" },
+              acceptance_chance: { type: "string", enum: ["Low", "Medium", "High"] }
             },
             required: ["university_name", "country", "category"]
           }
@@ -657,22 +662,14 @@ const streamChatWithCounsellor = async (req, res) => {
         type: "function",
         function: {
           name: "add_task",
-          description: "CREATE A NEW TASK. Do NOT use this if the user wants to mark an existing task as done (use set_task_status instead).",
+          description: "CREATE A NEW TASK.",
           parameters: {
             type: "object",
             properties: {
-              title: { type: "string", description: "Task title - clear and actionable" },
-              description: { type: "string", description: "Detailed task description" },
-              category: {
-                type: "string",
-                enum: ["exams", "sop", "lor", "documents", "visa", "research", "profile", "other"],
-                description: "Task category"
-              },
-              priority: {
-                type: "string",
-                enum: ["high", "medium", "low"],
-                description: "Task priority level"
-              }
+              title: { type: "string" },
+              description: { type: "string" },
+              category: { type: "string", enum: ["exams", "sop", "lor", "documents", "visa", "research", "profile", "other"] },
+              priority: { type: "string", enum: ["high", "medium", "low"] }
             },
             required: ["title"]
           }
@@ -682,22 +679,19 @@ const streamChatWithCounsellor = async (req, res) => {
         type: "function",
         function: {
           name: "get_university_recommendations",
-          description: "Generate fresh personalized university recommendations based on current profile",
-          parameters: {
-            type: "object",
-            properties: {}
-          }
+          description: "Generate fresh personalized university recommendations",
+          parameters: { type: "object", properties: {} }
         }
       },
       {
         type: "function",
         function: {
           name: "lock_university",
-          description: "Lock a shortlisted university as the user's primary choice. This unlocks application guidance. Only use on universities already in the shortlist.",
+          description: "Lock a shortlisted university as the user's primary choice.",
           parameters: {
             type: "object",
             properties: {
-              university_name: { type: "string", description: "Name of the university to lock (must be in shortlist)" }
+              university_name: { type: "string" }
             },
             required: ["university_name"]
           }
@@ -707,32 +701,21 @@ const streamChatWithCounsellor = async (req, res) => {
         type: "function",
         function: {
           name: "update_profile",
-          description: "Update the user's profile information. Use this when user asks to update, change, or set any profile field like GPA, IELTS score, target countries, budget, etc.",
+          description: "Update the user's profile information.",
           parameters: {
             type: "object",
             properties: {
               field: {
                 type: "string",
                 enum: [
-                  "gpa", "gpa_scale",
-                  "ielts_status", "ielts_score",
-                  "toefl_status", "toefl_score",
-                  "gre_status", "gre_score",
-                  "gmat_status", "gmat_score",
-                  "sop_status",
-                  "preferred_countries",
-                  "budget_range_min", "budget_range_max",
-                  "target_intake_year", "target_intake_season",
-                  "intended_degree", "field_of_study",
-                  "current_education_level", "work_experience_years",
-                  "funding_plan"
-                ],
-                description: "The profile field to update"
+                  "gpa", "gpa_scale", "ielts_status", "ielts_score", "toefl_status", "toefl_score",
+                  "gre_status", "gre_score", "gmat_status", "gmat_score", "sop_status",
+                  "preferred_countries", "budget_range_min", "budget_range_max",
+                  "target_intake_year", "target_intake_season", "intended_degree", "field_of_study",
+                  "current_education_level", "work_experience_years", "funding_plan"
+                ]
               },
-              value: {
-                type: "string",
-                description: "The new value for the field. CONVERT 'k' SUFFIXES TO ZEROS (e.g., '85k' -> '85000'). For arrays, use comma-separated values. For status: not-started, in-progress, completed."
-              }
+              value: { type: "string" }
             },
             required: ["field", "value"]
           }
@@ -742,16 +725,12 @@ const streamChatWithCounsellor = async (req, res) => {
         type: "function",
         function: {
           name: "set_task_status",
-          description: "Update the status of an existing task. REQUIRED for 'mark done', 'complete', 'finish'.",
+          description: "Update the status of an existing task.",
           parameters: {
             type: "object",
             properties: {
-              task_keyword: { type: "string", description: "A unique keyword or phrase from the task title to identify it" },
-              status: {
-                type: "string",
-                enum: ["completed", "pending"],
-                description: "The new status to set"
-              }
+              task_keyword: { type: "string" },
+              status: { type: "string", enum: ["completed", "pending"] }
             },
             required: ["task_keyword", "status"]
           }
@@ -759,446 +738,244 @@ const streamChatWithCounsellor = async (req, res) => {
       }
     ];
 
-    // Get conversation history
+    // OPTIMIZATION: Limit history to last 10 messages instead of 20
     const history = conversation.messages || [];
-    const recentHistory = history.slice(-20);
+    const recentHistory = history.slice(-10);
 
-    // Build messages array
     const messages = [
       {
         role: "system",
-        content: `You are an expert Study Abroad Counsellor with the ability to take actions on behalf of the user.
+        content: `You are an expert Study Abroad Counsellor.
         
-        Your role:
-        - Provide realistic, honest advice about university admissions
-        - TAKE ACTIONS when the user asks you to (add tasks, shortlist universities, lock universities, update profile)
-        - Be proactive in suggesting next steps
-        - Analyze if shortlisted universities are suitable and suggest locking the best one
+        Role:
+        - Provide realistic, honest advice.
+        - Be strict if profile is weak.
+        - Use tools to Take Actions (Shortlist, Add Task, Update Profile).
         
-        CRITICAL - TOOL USAGE RULES:
-        - You have access to tools/functions. The system will automatically handle tool calls for you.
-        - NEVER write function calls as text like "<function=..." or "update_profile(...)". This will cause errors.
-        - Simply describe what action you want to take and the system will invoke the appropriate tool.
-        - If you want to update a profile field, use the update_profile tool through the normal tool calling mechanism.
-
-        INTERACTION RULES:
-        - If user says "my profile", "show profile", or "what do you know about me" -> DISPLAY the profile summary from your context. Do NOT call recommendations.
-        - If user's input is vague (like "nmy profil;e"), invoke your reasoning capabilities to correct typos (e.g. assume "my profile") before acting.
-        
-        PERSONALIZATION RULE:
-        - When providing recommendations or advice, ALWAYS reference the user's specific profile to show you understand their context.
-        - Example: "Since you studied [Current Education] and want to pursue [Target Degree] in [Field]..."
-        - Example: "Given your GPA of [GPA], I recommend..."
-        
-        IMPORTANT - When to use tools:
-        - If user says "add task", "remind me", "create a task" → USE add_task tool
-        - If user says "mark done", "completed", "finish task" → USE set_task_status tool (NEVER add_task)
-        - If user says "shortlist", "add university", "add MIT" → USE shortlist_university tool (REQUIRED: Do NOT say you added it unless you call this tool)
-        - If user asks for recommendations → USE get_university_recommendations tool (REQUIRED: You MUST use this tool. Do NOT invent/hallucinate a list of universities as arguments. call it with empty args or reason).
-        - If user says "lock", "commit to", "choose [university]", "finalize" → USE lock_university tool (ONLY if university is already shortlisted)
-        - ONLY use update_profile tool when user specifies BOTH the field AND the value clearly
-          - CORRECT: "update my GPA to 3.8" → USE update_profile tool with field="gpa", value="3.8"
-          - CORRECT: "change my IELTS score to 7.5" → USE update_profile tool with field="ielts_score", value="7.5"
-          - WRONG: "update my profile" → DO NOT USE TOOL, instead ASK "What would you like to update? (GPA, IELTS score, budget, etc.)"
-          - WRONG: "update my GPA" (no value) → DO NOT USE TOOL, instead ASK "What is your new GPA?"
-          - VALUE PARSING: If user says "85k" or "50k", convert to "85000" or "50000" for the value parameter.
-          - Can update: gpa, gpa_scale, ielts_score, ielts_status, toefl_score, gre_score, preferred_countries, budget_range_min, budget_range_max, target_intake_year, intended_degree, field_of_study, sop_status, funding_plan
-        
-        GPA SCALE CONVERSION - IMPORTANT:
-        - If user wants to change their GPA scale (e.g., from 4.0 scale to 10.0 scale), you need to update BOTH fields:
-          1. First update gpa_scale to the new scale (e.g., "10")
-          2. Then update gpa to the CONVERTED value
-        - Conversion formula: new_gpa = (old_gpa / old_scale) * new_scale
-        - Example: 3.7/4.0 converted to 10-point scale = (3.7 / 4.0) * 10 = 9.25
-        - ALWAYS ask user to confirm the converted value before updating
-        - If user says "my GPA is 8.5/10", update gpa to "8.5" AND gpa_scale to "10"
-        
+        Context:
         ${profileContext}
         
-        CONTEXT-AWARE GUIDANCE:
-        1. If task progress is 100% (ALL TASKS COMPLETE):
-           - Congratulate the user! They're ready to submit their application
-           - Guide them on: final application review, submission process, interview preparation
-           - Suggest post-submission steps: tracking status, visa preparation, accommodation research
-           
-        2. If task progress is high (70-99%):
-           - Focus on completing remaining high-priority tasks
-           - Encourage them - they're almost there!
-           
-        3. If user has locked a university:
-           - Focus advice on that specific university's requirements
-           - Help with application-specific questions
-           
-        4. If no university is locked yet:
-           - Help them choose and lock a university first
-           
+        Tools:
+        - shortlist_university: Add to list
+        - add_task: Create new task
+        - set_task_status: Mark task done/pending
+        - get_university_recommendations: Get suggestions
+        - lock_university: Lock final choice
+        - update_profile: Update user data
         
-        When the user asks "what should I do next":
-        - Check their task progress above
-        - If 100% complete: guide on submission and next phase
-        - If not complete: highlight pending high-priority tasks
-
-        When the user asks to "check budget" or "check X":
-        - Look at the User Profile context and state the value clearly.
-        
-        Be conversational, helpful, PROACTIVE, and ACTION-ORIENTED.
-        VERIFICATION RULE: You must NEVER say "I have shortlisted" or "I have added a task" unless you are intentionally generating a tool call for it. If you cannot use the tool, admit it.
-        Format responses with **bold** for emphasis, use bullet points for lists.`
+        Be concise. Use headers/bullets.`
       },
-      ...recentHistory.map(msg => ({
-        role: msg.role,
-        content: msg.content
-      })),
+      ...recentHistory.map(msg => ({ role: msg.role, content: msg.content })),
       { role: "user", content: message }
     ];
 
-    // Save user message
-    await Conversation.addMessage(conversation.id, "user", message);
+    // Save user message immediately
+    // We don't await this to speed up initial response
+    Conversation.addMessage(conversation.id, "user", message).catch(err => console.error("Error saving user msg:", err));
 
     // Send conversation ID immediately
     res.write(`data: ${JSON.stringify({ type: 'start', conversation_id: conversation.id })}\n\n`);
 
-    // Helper function to parse malformed function calls from text
-    const parseMalformedToolCalls = (text) => {
-      const toolCalls = [];
-      // Match patterns like <function=name {...} </function> or <function=name {...} />
-      // We use [\s\S]*? to match across newlines
-      const pattern = /<function=(\w+)\s+([\s\S]*?)(?:<\/function>|\/>|$)/g;
+    console.time("Groq Stream");
 
-      let match;
-      while ((match = pattern.exec(text)) !== null) {
-        const name = match[1];
-        const argsText = match[2].trim();
-        let args = {};
+    // TRUE STREAMING CALL
+    const stream = await groq.chat.completions.create({
+      messages,
+      model: "llama-3.1-8b-instant",
+      tools,
+      tool_choice: "auto",
+      temperature: 0.7,
+      stream: true // Enable streaming
+    });
 
-        try {
-          if (argsText.startsWith('{') && (argsText.endsWith('}') || argsText.includes('}'))) {
-            const lastBrace = argsText.lastIndexOf('}');
-            const jsonPart = argsText.substring(0, lastBrace + 1);
-            args = JSON.parse(jsonPart);
-          } else {
-            args = JSON.parse(`{${argsText}}`);
-          }
-        } catch (e) {
-          console.log("JSON parse failed for malformed tool:", e.message);
-          const kvPattern = /"(\w+)":\s*"([^"]*)"/g;
-          let kvMatch;
-          while ((kvMatch = kvPattern.exec(argsText)) !== null) {
-            args[kvMatch[1]] = kvMatch[2];
-          }
-        }
+    let fullContent = "";
+    let toolCalls = [];
+    let currentToolCall = null;
 
-        if (Object.keys(args).length > 0) {
-          toolCalls.push({ name, args });
-        }
+    for await (const chunk of stream) {
+      const delta = chunk.choices[0]?.delta;
+
+      // Handle Content
+      if (delta?.content) {
+        fullContent += delta.content;
+        // Stream content chunk directly to client
+        res.write(`data: ${JSON.stringify({ type: 'chunk', content: delta.content })}\n\n`);
       }
 
-      // Pattern 2: Raw text style like "update_profile { ... }"
-      const rawPattern = /(update_profile|shortlist_university|add_task|get_university_recommendations|lock_university)\s*(\{[^}]*\})/g;
-
-      while ((match = rawPattern.exec(text)) !== null) {
-        const name = match[1];
-        const argsText = match[2].trim();
-        try {
-          const args = JSON.parse(argsText);
-          toolCalls.push({ name, args });
-        } catch (e) {
-          console.log("Failed to parse raw text JSON:", e.message);
-        }
-      }
-
-      return toolCalls;
-    };
-
-    let responseMessage;
-    let usedFallback = false;
-    let recoveredToolCalls = [];
-
-    // STEP 1: Make initial call WITH tools to check if actions needed
-    let toolChoice = "auto";
-    const userMsgLower = message.toLowerCase();
-
-    // Force tool usage for 8b model reliability
-    if (userMsgLower.includes("shortlist") || (userMsgLower.includes("add") && (userMsgLower.includes("list") || userMsgLower.includes("university") || userMsgLower.includes("uni")))) {
-      toolChoice = { type: "function", function: { name: "shortlist_university" } };
-      console.log("Forcing tool: shortlist_university");
-    } else if (userMsgLower.includes("recommend") || userMsgLower.includes("suggest universities") || (userMsgLower.includes("universities") && userMsgLower.includes("me"))) {
-      toolChoice = { type: "function", function: { name: "get_university_recommendations" } };
-      console.log("Forcing tool: get_university_recommendations");
-    } else if (userMsgLower.includes("task") || userMsgLower.includes("remind") || userMsgLower.includes("to-do") || userMsgLower.includes("todo")) {
-      toolChoice = { type: "function", function: { name: "add_task" } };
-      console.log("Forcing tool: add_task");
-    } else if (userMsgLower.includes("update") || userMsgLower.includes("set my") || userMsgLower.includes("change my")) {
-      toolChoice = { type: "function", function: { name: "update_profile" } };
-      console.log("Forcing tool: update_profile");
-    }
-
-    try {
-      const initialCompletion = await groq.chat.completions.create({
-        messages,
-        model: "llama-3.1-8b-instant",
-        tools,
-        tool_choice: toolChoice,
-        temperature: 0.7
-      });
-      responseMessage = initialCompletion.choices[0].message;
-    } catch (toolError) {
-      // If tool calling fails (malformed function call), try to recover from error message
-      console.log("Tool calling failed:", toolError.message);
-
-      // Attempt to extract failed generation from error object
-      // The structure varies, check multiple places
-      const failedGeneration = toolError.failed_generation ||
-        toolError.error?.failed_generation ||
-        toolError.error?.error?.failed_generation;
-
-      if (failedGeneration) {
-        console.log("Found failed_generation in error, attempting to parse:", failedGeneration);
-        recoveredToolCalls = parseMalformedToolCalls(failedGeneration);
-      }
-
-      if (recoveredToolCalls.length > 0) {
-        console.log("Successfully recovered tool calls:", recoveredToolCalls);
-        // We recovered the tools, but we still need a text response
-        usedFallback = true;
-        responseMessage = {
-          content: "", // Empty content triggers follow-up generation which will describe the actions taken
-          tool_calls: [] // We'll handle these manually via recoveredToolCalls
-        };
-      } else {
-        // Standard fallback if recovery failed
-        console.log("Could not recover tool calls, retrying with text-only mode...");
-        usedFallback = true;
-        try {
-          const retryCompletion = await groq.chat.completions.create({
-            messages: [
-              ...messages.slice(0, -1),
-              {
-                role: "user",
-                content: messages[messages.length - 1].content + "\n\n(SYSTEM: The tool call failed. Please ignore the tool error and simply provide your best university recommendations in plain text.)"
-              }
-            ],
-            model: "llama-3.1-8b-instant",
-            temperature: 0.5
-          });
-          responseMessage = retryCompletion.choices[0].message;
-        } catch (retryError) {
-          console.error("Retry also failed:", retryError.message);
-          responseMessage = {
-            content: "I apologize, but I'm having trouble processing your request right now.",
-            tool_calls: null
-          };
-        }
-      }
-    }
-
-    const actions = [];
-
-    // STEP 2: Execute any tool calls (or parse malformed ones from fallback)
-    let toolCallsToExecute = recoveredToolCalls;
-    if (toolCallsToExecute && toolCallsToExecute.length > 0) {
-      console.log("Using successfully recovered tool calls:", toolCallsToExecute.length);
-    } else {
-      toolCallsToExecute = [];
-    }
-
-    // DEBUG: Log what we got from the model
-    console.log("=== AI Response Debug ===");
-    console.log("Has tool_calls:", !!responseMessage.tool_calls);
-    console.log("Tool calls count:", responseMessage.tool_calls?.length || 0);
-    console.log("Used fallback:", usedFallback);
-    console.log("Content preview:", responseMessage.content?.substring(0, 200));
-    if (responseMessage.tool_calls) {
-      console.log("Tool calls:", JSON.stringify(responseMessage.tool_calls, null, 2));
-    }
-
-    if (toolCallsToExecute.length === 0 && responseMessage.tool_calls && responseMessage.tool_calls.length > 0) {
-      // Normal tool calls
-      toolCallsToExecute = responseMessage.tool_calls.map(tc => ({
-        name: tc.function.name,
-        args: JSON.parse(tc.function.arguments)
-      }));
-    } else if (toolCallsToExecute.length === 0 && responseMessage.content) {
-      // Try to parse malformed function calls from the text response
-      // We do this ALWAYS if there are no native tool calls, because the model might have just written the code as text
-      const parsedCalls = parseMalformedToolCalls(responseMessage.content);
-      if (parsedCalls.length > 0) {
-        console.log("Parsed malformed tool calls from content:", parsedCalls);
-        toolCallsToExecute = parsedCalls;
-      }
-    }
-
-    if (toolCallsToExecute.length > 0) {
-      for (const toolCall of toolCallsToExecute) {
-        const functionName = toolCall.name;
-        const functionArgs = toolCall.args;
-
-        let result;
-        let actionData;
-
-        switch (functionName) {
-          case "shortlist_university":
-            result = await executeShortlist(user.id, functionArgs);
-            actionData = {
-              action: "shortlist_added",
-              university: functionArgs.university_name,
-              country: functionArgs.country,
-              category: functionArgs.category,
-              success: result.success
-            };
-            actions.push(actionData);
-            // Send action event to frontend
-            res.write(`data: ${JSON.stringify({ type: 'action', ...actionData })}\n\n`);
-            break;
-
-          case "add_task":
-            result = await executeAddTask(user.id, functionArgs);
-            actionData = {
-              action: "task_added",
-              task: functionArgs.title,
-              category: functionArgs.category || 'other',
-              priority: functionArgs.priority || 'medium',
-              success: result.success
-            };
-            actions.push(actionData);
-            // Send action event to frontend
-            res.write(`data: ${JSON.stringify({ type: 'action', ...actionData })}\n\n`);
-            break;
-
-          case "get_university_recommendations":
-            result = await executeGetRecommendations(user);
-            actionData = {
-              action: "recommendations_generated",
-              count: result.count || 0,
-              success: result.success,
-              recommendations: result.recommendations // Pass raw data to frontend
-            };
-            actions.push(actionData);
-            res.write(`data: ${JSON.stringify({ type: 'action', ...actionData })}\n\n`);
-            break;
-
-          case "lock_university":
-            result = await executeLockUniversity(user.id, functionArgs, shortlist);
-            actionData = {
-              action: "university_locked",
-              university: functionArgs.university_name,
-              success: result.success,
-              message: result.message
-            };
-            actions.push(actionData);
-            res.write(`data: ${JSON.stringify({ type: 'action', ...actionData })}\n\n`);
-            break;
-
-          case "update_profile":
-            result = await executeUpdateProfile(user.id, user.profile_data || {}, functionArgs);
-            // IMPORTANT: Refresh user.profile_data so subsequent tool calls use fresh data
-            if (result.success && result.updatedProfile) {
-              user.profile_data = result.updatedProfile;
+      // Handle Tool Calls (Accumulate)
+      if (delta?.tool_calls) {
+        for (const toolCallChunk of delta.tool_calls) {
+          if (toolCallChunk.id) {
+            // New tool call starting
+            if (currentToolCall) {
+              toolCalls.push(currentToolCall);
             }
-            actionData = {
-              action: "profile_updated",
-              field: functionArgs.field,
-              value: functionArgs.value,
-              success: result.success,
-              message: result.message
+            currentToolCall = {
+              id: toolCallChunk.id,
+              name: toolCallChunk.function?.name || "",
+              args: toolCallChunk.function?.arguments || ""
             };
-            actions.push(actionData);
-            res.write(`data: ${JSON.stringify({ type: 'action', ...actionData })}\n\n`);
-            break;
+          } else if (currentToolCall) {
+            // Continuing existing tool call
+            if (toolCallChunk.function?.name) {
+              currentToolCall.name += toolCallChunk.function.name;
+            }
+            if (toolCallChunk.function?.arguments) {
+              currentToolCall.args += toolCallChunk.function.arguments;
+            }
+          }
         }
       }
     }
 
-    // STEP 3: Get the AI's text response
-    // If there were tool calls, we need to continue the conversation with tool results
-    let aiReplyContent = responseMessage.content;
-
-    // CLEANUP: Remove any raw function call text from the response before sending
-    if (aiReplyContent) {
-      // Pattern 1: XML-style <function=name>...</function>
-      const xmlPattern = /<function=(\w+)\s+([\s\S]*?)(?:<\/function>|\/>|$)/g;
-
-      // Pattern 2: Raw text style like "update_profile { ... }" or "shortlist_university({ ... })"
-      // Matches: function_name followed by space/parenthesis and then { ... }
-      const rawPattern = /(?:update_profile|shortlist_university|add_task|get_university_recommendations|lock_university)\s*(?:\{|[\(]\s*\{)[\s\S]*?(?:\}|[\)]\s*\})/g;
-
-      aiReplyContent = aiReplyContent
-        .replace(xmlPattern, '')
-        .replace(rawPattern, '')
-        .trim();
+    // Push the last tool call if exists
+    if (currentToolCall) {
+      toolCalls.push(currentToolCall);
     }
 
-    if (!aiReplyContent && actions.length > 0) {
-      // AI only made tool calls, no text. Generate a follow-up response.
-      let toolResultMessages;
+    console.timeEnd("Groq Stream");
 
-      if (responseMessage.tool_calls && responseMessage.tool_calls.length > 0) {
-        // Normal tool calls - include tool results
-        toolResultMessages = [
+    // Execute Tool Calls if any
+    const actions = [];
+    if (toolCalls.length > 0) {
+      console.log(`Executing ${toolCalls.length} tool calls...`);
+
+      for (const tc of toolCalls) {
+        try {
+          const functionName = tc.name;
+          const functionArgs = JSON.parse(tc.args);
+          let result;
+          let actionData;
+
+          switch (functionName) {
+            case "shortlist_university":
+              result = await executeShortlist(user.id, functionArgs);
+              actionData = {
+                action: "shortlist_added",
+                university: functionArgs.university_name,
+                category: functionArgs.category,
+                success: result.success
+              };
+              break;
+
+            case "add_task":
+              result = await executeAddTask(user.id, functionArgs);
+              actionData = {
+                action: "task_added",
+                task: functionArgs.title,
+                success: result.success
+              };
+              break;
+
+            case "get_university_recommendations":
+              result = await executeGetRecommendations(user);
+              actionData = {
+                action: "recommendations_generated",
+                count: result.count || 0,
+                success: result.success,
+                recommendations: result.recommendations
+              };
+              break;
+
+            case "lock_university":
+              result = await executeLockUniversity(user.id, functionArgs, shortlist);
+              actionData = {
+                action: "university_locked",
+                university: functionArgs.university_name,
+                success: result.success
+              };
+              break;
+
+            case "update_profile":
+              result = await executeUpdateProfile(user.id, user.profile_data || {}, functionArgs);
+              actionData = {
+                action: "profile_updated",
+                field: functionArgs.field,
+                value: functionArgs.value,
+                success: result.success
+              };
+              break;
+
+            case "set_task_status":
+              result = await executeUpdateTask(user.id, functionArgs, tasks);
+              actionData = {
+                action: "task_updated",
+                task: functionArgs.task_keyword,
+                status: functionArgs.status,
+                success: result.success
+              };
+              break;
+          }
+
+          if (actionData) {
+            actions.push(actionData);
+            // Stream action to client immediately
+            res.write(`data: ${JSON.stringify({ type: 'action', ...actionData })}\n\n`);
+          }
+
+        } catch (e) {
+          console.error("Tool execution error:", e);
+        }
+      }
+
+      // If we had tool calls but no content, we might want to generate a follow-up summary
+      // If we had tool calls but no content, we MUST generate a follow-up summary
+      if (!fullContent && actions.length > 0) {
+
+        // Construct the assistant message that just happened
+        const assistantMessage = {
+          role: "assistant",
+          content: null,
+          tool_calls: toolCalls.map(tc => ({
+            id: tc.id,
+            type: "function",
+            function: { name: tc.name, arguments: tc.args }
+          }))
+        };
+
+        const toolResultMessages = [
           ...messages,
-          responseMessage,
-          ...responseMessage.tool_calls.map(tc => ({
+          assistantMessage,
+          ...toolCalls.map((tc, index) => ({
             role: "tool",
             tool_call_id: tc.id,
-            content: JSON.stringify({ success: true, message: "Action completed successfully" })
+            content: JSON.stringify(actions[index] || { success: true })
           }))
         ];
-      } else {
-        // Parsed malformed tool calls - just add a system message about completed actions
-        toolResultMessages = [
-          ...messages,
-          {
-            role: "assistant",
-            content: `I've completed the following actions: ${actions.map(a => a.action).join(', ')}. Let me provide more details.`
-          }
-        ];
-      }
 
-      try {
-        const followUp = await groq.chat.completions.create({
-          messages: toolResultMessages,
-          model: "llama-3.1-8b-instant", // Use versatile model for follow-up text generation
-          temperature: 0.7,
-          stream: true
-        });
+        try {
+          const followUp = await groq.chat.completions.create({
+            messages: toolResultMessages,
+            model: "llama-3.1-8b-instant",
+            temperature: 0.7,
+            stream: true
+          });
 
-        let fullContent = '';
-        for await (const chunk of followUp) {
-          const content = chunk.choices[0]?.delta?.content || '';
-          if (content) {
-            fullContent += content;
-            res.write(`data: ${JSON.stringify({ type: 'chunk', content })}\n\n`);
+          for await (const chunk of followUp) {
+            const content = chunk.choices[0]?.delta?.content || '';
+            if (content) {
+              fullContent += content;
+              res.write(`data: ${JSON.stringify({ type: 'chunk', content })}\n\n`);
+            }
           }
+        } catch (e) {
+          console.error("Follow-up generation error:", e);
+          const fallback = "I've completed the requested actions.";
+          res.write(`data: ${JSON.stringify({ type: 'chunk', content: fallback })}\n\n`);
+          fullContent += fallback;
         }
-        aiReplyContent = fullContent;
-      } catch (followUpError) {
-        console.error("Follow-up generation error:", followUpError.message);
-        const fallbackText = "Action completed successfully.";
-        res.write(`data: ${JSON.stringify({ type: 'chunk', content: fallbackText })}\n\n`);
-        aiReplyContent = fallbackText;
-      }
-    } else if (aiReplyContent) {
-      // Stream the existing content character by character for typewriter effect
-      // But since we already have the full content, we'll send it in chunks
-      const chunkSize = 10;
-      for (let i = 0; i < aiReplyContent.length; i += chunkSize) {
-        const chunk = aiReplyContent.slice(i, i + chunkSize);
-        res.write(`data: ${JSON.stringify({ type: 'chunk', content: chunk })}\n\n`);
-        // Small delay for typewriter effect
-        await new Promise(resolve => setTimeout(resolve, 15));
       }
     }
 
-    // Save full response to conversation
-    // Save full response to conversation
-    if (aiReplyContent) {
-      await Conversation.addMessage(conversation.id, "assistant", aiReplyContent);
+    // Save assistant response
+    if (fullContent) {
+      Conversation.addMessage(conversation.id, "assistant", fullContent).catch(e => console.error("Error saving specific msg", e));
     }
 
-    // Send completion signal
+    // Done signal
     res.write(`data: ${JSON.stringify({
       type: 'done',
-      full_content: aiReplyContent || '',
+      full_content: fullContent,
       actions: actions,
       has_actions: actions.length > 0
     })}\n\n`);
