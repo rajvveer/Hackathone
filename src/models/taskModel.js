@@ -56,7 +56,7 @@ const Task = {
   // Mark task as complete
   markComplete: async (taskId, userId) => {
     const result = await pool.query(
-      "UPDATE tasks SET status = 'completed' WHERE id = $1 AND user_id = $2 RETURNING *",
+      "UPDATE tasks SET status = 'completed', completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND user_id = $2 RETURNING *",
       [taskId, userId]
     );
     return result.rows[0];
@@ -65,7 +65,7 @@ const Task = {
   // Mark task as pending (undo complete)
   markPending: async (taskId, userId) => {
     const result = await pool.query(
-      "UPDATE tasks SET status = 'pending' WHERE id = $1 AND user_id = $2 RETURNING *",
+      "UPDATE tasks SET status = 'pending', completed_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND user_id = $2 RETURNING *",
       [taskId, userId]
     );
     return result.rows[0];
@@ -101,7 +101,7 @@ const Task = {
     if (fields.length === 0) return null;
 
     values.push(taskId, userId);
-    const query = `UPDATE tasks SET ${fields.join(', ')} WHERE id = $${paramCount++} AND user_id = $${paramCount} RETURNING *`;
+    const query = `UPDATE tasks SET ${fields.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = $${paramCount++} AND user_id = $${paramCount} RETURNING *`;
 
     const result = await pool.query(query, values);
     return result.rows[0];
@@ -121,6 +121,15 @@ const Task = {
     const result = await pool.query(
       'DELETE FROM tasks WHERE user_id = $1 AND ai_generated = true RETURNING *',
       [userId]
+    );
+    return result.rows;
+  },
+
+  // Delete all tasks associated with a specific university
+  deleteByUniversity: async (userId, universityId) => {
+    const result = await pool.query(
+      'DELETE FROM tasks WHERE user_id = $1 AND university_id = $2 RETURNING *',
+      [userId, universityId]
     );
     return result.rows;
   },

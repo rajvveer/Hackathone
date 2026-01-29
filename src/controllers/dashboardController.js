@@ -90,6 +90,47 @@ const calculateProfileStrength = (profile) => {
   };
 };
 
+// Helper: Calculate Overall Progress (0-100%)
+// Breakdown:
+// 1. Profile Building (0-25%)
+// 2. Discovery/Shortlisting (25-50%)
+// 3. Decision/Locking (50-75%)
+// 4. Application Tasks (75-100%)
+const calculateOverallProgress = (profileStrength, shortlistCount, lockedUniversity, taskStats) => {
+  let progress = 0;
+
+  // Stage 1: Profile (Max 25%)
+  const profileScore = profileStrength.score || 0;
+  const profileMax = profileStrength.max_score || 12;
+  progress += Math.min(25, Math.round((profileScore / profileMax) * 25));
+
+  // Stage 2: Shortlisting (Max 25%)
+  if (shortlistCount > 0) {
+    // Cap at 5 universities for full 25 points
+    const shortlistScore = Math.min(5, shortlistCount);
+    progress += Math.min(25, Math.round((shortlistScore / 5) * 25));
+  }
+
+  // Stage 3: Locking (Max 25%)
+  if (lockedUniversity) {
+    // If locked, we assume Stage 3 is complete.
+    // We enforce a minimum base of 75% if locked, to account for implied completion of previous stages.
+    if (progress < 50) progress = 50;
+    progress += 25; // Add the locking points
+  }
+
+  // Stage 4: Tasks (Max 25%)
+  if (lockedUniversity) {
+    const total = parseInt(taskStats.total) || 0;
+    const completed = parseInt(taskStats.completed) || 0;
+    if (total > 0) {
+      progress += Math.round((completed / total) * 25);
+    }
+  }
+
+  return Math.min(100, progress);
+};
+
 // Helper: Get stage information
 const getStageInfo = (stage) => {
   const stages = {
@@ -193,6 +234,9 @@ const getDashboardStats = async (req, res) => {
     // 6. Get updated task stats after auto-generation
     const updatedTaskStats = await Task.getStats(user.id);
 
+    // 7. Calculate Overall Progress
+    const overallProgress = calculateOverallProgress(strength, stats.shortlisted, lockedUniversity, updatedTaskStats);
+
     res.json({
       profile_summary: {
         education: profile.current_education_level || "Not set",
@@ -211,7 +255,8 @@ const getDashboardStats = async (req, res) => {
         completed_tasks: parseInt(updatedTaskStats.completed),
         total_tasks: parseInt(updatedTaskStats.total),
         completion_percentage: updatedTaskStats.total > 0 ?
-          Math.round((updatedTaskStats.completed / updatedTaskStats.total) * 100) : 0
+          Math.round((updatedTaskStats.completed / updatedTaskStats.total) * 100) : 0,
+        overall_progress: overallProgress
       },
       locked_university: lockedUniversity,
       next_steps: getNextSteps(user.stage, profile, stats)
@@ -222,6 +267,8 @@ const getDashboardStats = async (req, res) => {
     res.status(500).json({ error: 'Server Error' });
   }
 };
+
+
 
 // Helper: Auto-generate tasks based on profile gaps
 const autoGenerateTasks = async (userId, profile, stage, stats) => {
@@ -243,6 +290,63 @@ const autoGenerateTasks = async (userId, profile, stage, stats) => {
         title: "Explore university recommendations from AI Counsellor",
         category: "discovery",
         priority: "high",
+        ai_generated: true
+      });
+    }
+  }
+
+  // Stage 3: Shortlist tasks
+  if (stats.shortlisted > 0 && !stats.locked) { // User has shortlisted but not locked
+    const existingShortlistTasks = await pool.query(
+      "SELECT * FROM tasks WHERE user_id = $1 AND category = 'shortlist' AND ai_generated = true",
+      [userId]
+    );
+
+    if (existingShortlistTasks.rows.length === 0) {
+      tasksToCreate.push({
+        title: "Review fit analysis for shortlisted universities",
+        category: "shortlist",
+        priority: "high",
+        ai_generated: true
+      });
+      tasksToCreate.push({
+        title: "Lock your final choice university",
+        description: "Select your top choice to proceed to the application stage",
+        category: "shortlist",
+        priority: "critical",
+        ai_generated: true
+      });
+    }
+  }
+
+  // Stage 4: Application tasks
+  if (stats.locked) { // User has locked a university
+    const existingAppTasks = await pool.query(
+      "SELECT * FROM tasks WHERE user_id = $1 AND category = 'application' AND ai_generated = true",
+      [userId]
+    );
+
+    if (existingAppTasks.rows.length === 0) {
+      tasksToCreate.push({
+        title: "Request Letters of Recommendation (LOR)",
+        description: "Identify and request 2-3 recommenders",
+        category: "application",
+        priority: "critical",
+        due_date: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // +30 days
+        ai_generated: true
+      });
+      tasksToCreate.push({
+        title: "Prepare financial documents",
+        description: "Gather bank statements and funding proofs",
+        category: "application",
+        priority: "high",
+        ai_generated: true
+      });
+      tasksToCreate.push({
+        title: "Complete Application Form",
+        description: "Fill out the university application portal",
+        category: "application",
+        priority: "critical",
         ai_generated: true
       });
     }

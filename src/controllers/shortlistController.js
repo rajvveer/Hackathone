@@ -311,8 +311,8 @@ const unlockUniversity = async (req, res) => {
     // Get locked university details for response
     const locked = await Shortlist.findById(req.user.locked_university_id);
 
-    // Delete all AI-generated tasks
-    const deletedTasks = await Task.deleteAIGenerated(req.user.id);
+    // Delete all tasks associated with this university (AI generated or otherwise linked)
+    const deletedTasks = await Task.deleteByUniversity(req.user.id, req.user.locked_university_id);
 
     // Unlock in database and get updated user
     const updatedUser = await User.unlockUniversity(req.user.id);

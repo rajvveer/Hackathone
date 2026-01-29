@@ -153,6 +153,8 @@ const updateProfile = async (req, res) => {
     // Validate input
     const validation = validateProfileData(profileData);
     if (!validation.valid) {
+      console.log("Profile Validation Failed:", JSON.stringify(validation.errors, null, 2));
+      console.log("Received Data:", JSON.stringify(profileData, null, 2));
       return res.status(400).json({
         error: "Validation failed",
         errors: validation.errors

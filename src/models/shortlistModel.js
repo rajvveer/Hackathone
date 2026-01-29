@@ -92,6 +92,15 @@ const Shortlist = {
       [userId]
     );
     return result.rows;
+  },
+
+  // Find shortlist by University Name (case-insensitive)
+  findByUniName: async (userId, uniName) => {
+    const result = await pool.query(
+      'SELECT * FROM shortlists WHERE user_id = $1 AND LOWER(uni_name) = LOWER($2)',
+      [userId, uniName]
+    );
+    return result.rows[0];
   }
 };
 

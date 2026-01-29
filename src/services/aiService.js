@@ -49,6 +49,12 @@ const generateRecommendations = async (profile) => {
       - Degree: ${profile.intended_degree}
       
       Generate realistic university recommendations in 3 categories (Dream, Target, Safe).
+      
+      STRICT CONSTRAINTS:
+      1. ONLY recommend universities from these countries: ${profile.preferred_countries?.join(", ") || "Any"}
+      2. Do NOT suggest universities from other countries even if they are good fits.
+      3. If no countries are listed, you may suggest from top destinations (USA, UK, Canada, Australia).
+      
       Each university needs: name, location, acceptance_rate
       
       Output JSON:

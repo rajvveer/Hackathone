@@ -146,7 +146,9 @@ const runMigrations = async () => {
     "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS category VARCHAR(50)",
     "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS priority VARCHAR(20) DEFAULT 'medium'",
     "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS ai_generated BOOLEAN DEFAULT FALSE",
-    "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS university_id INT"
+    "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS university_id INT",
+    "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP",
+    "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
   ];
 
   for (const migration of migrations) {
