@@ -201,23 +201,17 @@ const getDashboardStats = async (req, res) => {
     // 2. Get Stage Info
     const stageInfo = getStageInfo(user.stage);
 
-    // 3. Get Counts
-    const shortlistCount = await pool.query(
-      'SELECT COUNT(*) FROM shortlists WHERE user_id = $1',
-      [user.id]
-    );
+    // 3. Get Counts & Locked University (Parallelized for performance)
+    const [shortlistCount, taskStats, lockedUniversityResult] = await Promise.all([
+      pool.query('SELECT COUNT(*) FROM shortlists WHERE user_id = $1', [user.id]),
+      Task.getStats(user.id),
+      user.locked_university_id
+        ? pool.query('SELECT * FROM shortlists WHERE id = $1', [user.locked_university_id])
+        : Promise.resolve({ rows: [] })
+    ]);
 
-    const taskStats = await Task.getStats(user.id);
-
-    // 4. Get locked university if exists
-    let lockedUniversity = null;
-    if (user.locked_university_id) {
-      const uniResult = await pool.query(
-        'SELECT * FROM shortlists WHERE id = $1',
-        [user.locked_university_id]
-      );
-      lockedUniversity = uniResult.rows[0];
-    }
+    // 4. Extract locked university from result
+    const lockedUniversity = lockedUniversityResult.rows[0] || null;
 
     const stats = {
       shortlisted: parseInt(shortlistCount.rows[0].count),
