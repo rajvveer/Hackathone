@@ -6,11 +6,13 @@ const Shortlist = require('../models/shortlistModel');
 const Task = require('../models/taskModel');
 const { generateRecommendations } = require('../services/aiService');
 
+
 // @desc    Chat with AI Counsellor (with function calling)
 // @route   POST /api/ai/chat
 const chatWithCounsellor = async (req, res) => {
   const { message, conversation_id } = req.body;
   const user = req.user;
+
 
   try {
     // Get or create conversation
@@ -23,9 +25,11 @@ const chatWithCounsellor = async (req, res) => {
       conversation = conversation.rows[0];
     }
 
+
     if (!conversation) {
       conversation = await Conversation.getOrCreate(user.id);
     }
+
 
     // Build profile context
     const profile = user.profile_data || {};
@@ -46,6 +50,7 @@ const chatWithCounsellor = async (req, res) => {
       - GRE: ${profile.gre_status || "not started"}
       - SOP Status: ${profile.sop_status || "not started"}
     `;
+
 
     // Define available functions for AI
     const tools = [
@@ -139,50 +144,66 @@ const chatWithCounsellor = async (req, res) => {
             required: ["task_keyword", "status"]
           }
         }
+      },
+      {
+        type: "function",
+        function: {
+          name: "lock_university",
+          description: "Lock a shortlisted university as the user's primary choice.",
+          parameters: {
+            type: "object",
+            properties: {
+              university_name: { type: "string", description: "Name of the university to lock" }
+            },
+            required: ["university_name"]
+          }
+        }
       }
     ];
+
 
     // Get conversation history
     const history = conversation.messages || [];
     const recentHistory = history.slice(-20); // Last 20 messages
 
+
     // Build messages array
     const messages = [
       {
         role: "system",
-        content: `You are an expert Study Abroad Counsellor with the ability to take actions on behalf of the user.
-        
+        content: `You are an expert Study Abroad Counsellor with access to tools for taking actions.
+       
         Your role:
         - Provide realistic, honest advice about university admissions
         - Be strict when the user's profile doesn't match their aspirations
         - Use data to support your recommendations
         - Take actions when appropriate (shortlist universities, add tasks)
-        
-        CRITICAL - TOOL USAGE RULES:
-        - You have access to tools/functions. The system will automatically handle tool calls for you.
-        - NEVER write function calls as text like "<function=..." or "update_profile(...)". This will cause errors.
-        - Simply describe what action you want to take and the system will invoke the appropriate tool.
-        - If you want to update a profile field, use the update_profile tool.
-        - If you want to mark a task as done, use the set_task_status tool.
-        
+       
+        CRITICAL RULES:
+        1. You have tools available - use them when appropriate
+        2. NEVER write function calls as text (e.g., "<function=...", "tool_name(...)")
+        3. NEVER mention tool names in your response text
+        4. When you need to take an action, use the tool directly - the system handles it automatically
+        5. Provide conversational responses alongside tool usage
+       
         Important guidelines:
         - If budget is low (<$20k/year), suggest affordable countries like Germany, Norway, or scholarships
         - If GPA is below 3.0/4.0 (75%), be cautious about top universities
         - Always explain WHY a university fits or doesn't fit
         - Highlight risks honestly (e.g., "Your GPA is below their average")
         - Encourage preparation (exams, SOP) before applications
-        
+       
         ${profileContext}
-        
-        You can use these functions:
+       
+        Available tools:
         1. shortlist_university - When you recommend a specific university
-        2. add_task - CREATE NEW TASKS ONLY. Do not use for existing ones.
-        3. set_task_status - MARK TASKS DONE. Use when user says "mark X done" or "complete X".
+        2. add_task - CREATE NEW TASKS ONLY
+        3. set_task_status - MARK TASKS DONE
         4. get_university_recommendations - To generate fresh recommendations
-        
+       
         VALUE NORMALIZATION:
         - If user provides a number with 'k' suffix (e.g., '85k', '50k'), ALWAYS convert it to thousands (e.g., '85000', '50000') before calling tools.
-        
+       
         Be conversational but professional. Use the user's name occasionally.`
       },
       ...recentHistory.map(msg => ({
@@ -192,19 +213,24 @@ const chatWithCounsellor = async (req, res) => {
       { role: "user", content: message }
     ];
 
+
     // Call Groq with function calling
     const completion = await groq.chat.completions.create({
       messages,
       model: "llama-3.1-8b-instant",
       tools,
       tool_choice: "auto",
-      temperature: 0.7
+      temperature: 0.7,
+      max_tokens: 2000 // Ensure enough tokens for complete tool calls
     });
+
 
     const responseMessage = completion.choices[0].message;
 
+
     // Save user message to conversation
     await Conversation.addMessage(conversation.id, "user", message);
+
 
     // Check if AI wants to call functions
     const actions = [];
@@ -213,7 +239,9 @@ const chatWithCounsellor = async (req, res) => {
         const functionName = toolCall.function.name;
         const functionArgs = JSON.parse(toolCall.function.arguments);
 
+
         let result;
+
 
         switch (functionName) {
           case "shortlist_university":
@@ -226,6 +254,7 @@ const chatWithCounsellor = async (req, res) => {
             });
             break;
 
+
           case "add_task":
             result = await executeAddTask(user.id, functionArgs);
             actions.push({
@@ -235,6 +264,7 @@ const chatWithCounsellor = async (req, res) => {
             });
             break;
 
+
           case "get_university_recommendations":
             result = await executeGetRecommendations(user);
             actions.push({
@@ -242,6 +272,7 @@ const chatWithCounsellor = async (req, res) => {
               result
             });
             break;
+
 
           case "set_task_status":
             result = await executeUpdateTask(user.id, functionArgs, user.tasks || []);
@@ -252,15 +283,30 @@ const chatWithCounsellor = async (req, res) => {
               result
             });
             break;
+
+
+          case "lock_university":
+            // Fetch shortlist for the user
+            const shortlist = await Shortlist.findAllByUser(user.id);
+            result = await executeLockUniversity(user.id, functionArgs, shortlist);
+            actions.push({
+              action: "university_locked",
+              university: functionArgs.university_name,
+              result
+            });
+            break;
         }
       }
     }
 
+
     // Prepare response
     const aiReply = responseMessage.content || "I've taken the following actions for you.";
 
+
     // Save AI response to conversation
     await Conversation.addMessage(conversation.id, "assistant", aiReply);
+
 
     res.json({
       reply: aiReply,
@@ -268,6 +314,7 @@ const chatWithCounsellor = async (req, res) => {
       conversation_id: conversation.id,
       has_actions: actions.length > 0
     });
+
 
   } catch (err) {
     console.error("AI Chat error:", err);
@@ -277,6 +324,7 @@ const chatWithCounsellor = async (req, res) => {
     });
   }
 };
+
 
 // Helper: Execute shortlist action
 const executeShortlist = async (userId, args) => {
@@ -292,6 +340,7 @@ const executeShortlist = async (userId, args) => {
       };
     }
 
+
     const newShortlist = await Shortlist.add(userId, {
       uni_name: args.university_name,
       country: args.country,
@@ -304,6 +353,7 @@ const executeShortlist = async (userId, args) => {
         timestamp: new Date().toISOString()
       }
     });
+
 
     return {
       success: true,
@@ -319,6 +369,7 @@ const executeShortlist = async (userId, args) => {
   }
 };
 
+
 // Helper: Execute add task action
 const executeAddTask = async (userId, args) => {
   try {
@@ -328,6 +379,7 @@ const executeAddTask = async (userId, args) => {
       priority: args.priority || 'medium',
       ai_generated: true
     });
+
 
     return {
       success: true,
@@ -343,12 +395,14 @@ const executeAddTask = async (userId, args) => {
   }
 };
 
+
 // Helper: Execute update task action
 const executeUpdateTask = async (userId, args, existingTasks) => {
   try {
     console.log("Execute update task called with:", args);
     const { task_keyword, status } = args;
     const { pool } = require('../config/db');
+
 
     // 1. Find the task matching the keyword
     // Search in existingTasks context first, or query DB if needed (butcontext is faster)
@@ -357,9 +411,11 @@ const executeUpdateTask = async (userId, args, existingTasks) => {
     const tasksResult = await pool.query('SELECT * FROM tasks WHERE user_id = $1', [userId]);
     const tasks = tasksResult.rows;
 
+
     const matchedTask = tasks.find(t =>
       t.title.toLowerCase().includes(task_keyword.toLowerCase())
     );
+
 
     if (!matchedTask) {
       return {
@@ -368,9 +424,11 @@ const executeUpdateTask = async (userId, args, existingTasks) => {
       };
     }
 
+
     // 2. Determine new status
     let newStatus = matchedTask.status;
     let completedAt = matchedTask.completed_at;
+
 
     if (status === 'completed') {
       newStatus = 'completed';
@@ -380,17 +438,20 @@ const executeUpdateTask = async (userId, args, existingTasks) => {
       completedAt = null;
     }
 
+
     // 3. Update task
     const updatedTask = await pool.query(
       'UPDATE tasks SET status = $1, completed_at = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3 RETURNING *',
       [newStatus, completedAt, matchedTask.id]
     );
 
+
     return {
       success: true,
       message: `Marked task "${matchedTask.title}" as ${newStatus}`,
       task: updatedTask.rows[0]
     };
+
 
   } catch (err) {
     console.error("Update task execution error:", err);
@@ -400,6 +461,7 @@ const executeUpdateTask = async (userId, args, existingTasks) => {
     };
   }
 };
+
 
 // Helper: Execute get recommendations action
 const executeGetRecommendations = async (user) => {
@@ -412,7 +474,9 @@ const executeGetRecommendations = async (user) => {
     );
     const freshProfile = freshUserResult.rows[0]?.profile_data || user.profile_data;
 
+
     const recommendations = await generateRecommendations(freshProfile);
+
 
     return {
       success: true,
@@ -427,6 +491,7 @@ const executeGetRecommendations = async (user) => {
     };
   }
 };
+
 
 // Helper: Execute lock university action
 const executeLockUniversity = async (userId, args, shortlist) => {
@@ -445,8 +510,14 @@ const executeLockUniversity = async (userId, args, shortlist) => {
       };
     }
 
-    // Lock the university
-    await Shortlist.lock(userId, matchedUni.id);
+    // Lock the university in shortlist table
+    await Shortlist.lock(matchedUni.id);
+
+    // Also update the user's locked_university_id
+    await pool.query(
+      'UPDATE users SET locked_university_id = $1, stage = 4 WHERE id = $2',
+      [matchedUni.id, userId]
+    );
 
     return {
       success: true,
@@ -462,11 +533,13 @@ const executeLockUniversity = async (userId, args, shortlist) => {
   }
 };
 
+
 // Helper: Execute profile update action
 const executeUpdateProfile = async (userId, currentProfile, args) => {
   try {
     const { field, value } = args;
     const updatedProfile = { ...currentProfile };
+
 
     // Handle different field types
     switch (field) {
@@ -474,6 +547,7 @@ const executeUpdateProfile = async (userId, currentProfile, args) => {
       case 'preferred_countries':
         updatedProfile[field] = value.split(',').map(v => v.trim());
         break;
+
 
       // Numeric fields
       case 'gpa':
@@ -488,6 +562,7 @@ const executeUpdateProfile = async (userId, currentProfile, args) => {
       case 'work_experience_years':
         updatedProfile[field] = parseFloat(value) || value;
         break;
+
 
       // Status fields
       case 'ielts_status':
@@ -504,21 +579,26 @@ const executeUpdateProfile = async (userId, currentProfile, args) => {
         }
         break;
 
+
       // String fields
       default:
         updatedProfile[field] = value;
         break;
     }
 
+
     // Keep onboarding completed status
     updatedProfile.onboarding_completed = currentProfile.onboarding_completed || true;
+
 
     // Update in database
     const User = require('../models/userModel');
     await User.updateProfile(userId, updatedProfile);
 
+
     // Format field name for display
     const displayField = field.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+
 
     return {
       success: true,
@@ -535,12 +615,14 @@ const executeUpdateProfile = async (userId, currentProfile, args) => {
 };
 
 
+
 // @desc    Get conversation history
 // @route   GET /api/ai/conversation/:id
 const getConversation = async (req, res) => {
   try {
     const { id } = req.params;
     const history = await Conversation.getHistory(id);
+
 
     res.json({
       conversation_id: id,
@@ -552,12 +634,14 @@ const getConversation = async (req, res) => {
   }
 };
 
+
 // @desc    Clear conversation history
 // @route   DELETE /api/ai/conversation/:id
 const clearConversation = async (req, res) => {
   try {
     const { id } = req.params;
     await Conversation.clear(id);
+
 
     res.json({ message: "Conversation cleared successfully" });
   } catch (err) {
@@ -566,10 +650,12 @@ const clearConversation = async (req, res) => {
   }
 };
 
+
 // @desc    Stream chat with AI Counsellor (SSE) - WITH TOOL EXECUTION
 // @route   POST /api/ai/chat/stream
 const streamChatWithCounsellor = async (req, res) => {
   const { message, conversation_id } = req.body;
+
 
   // FORCE FRESH USER DATA FETCH
   const { pool } = require('../config/db');
@@ -581,12 +667,14 @@ const streamChatWithCounsellor = async (req, res) => {
     user = req.user; // Fallback
   }
 
+
   // Set up SSE headers - Critical for streaming
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no'); // Disable Nginx buffering
   res.flushHeaders();
+
 
   try {
     // OPTIMIZED: Reduce parallel fetching load
@@ -599,6 +687,7 @@ const streamChatWithCounsellor = async (req, res) => {
     ]);
     console.timeEnd("Context Fetch");
 
+
     // Process shortlist (Optimize: limited details)
     const shortlist = shortlistResult || [];
     const lockedUni = shortlist.find(s => s.id === user.locked_university_id);
@@ -607,6 +696,7 @@ const streamChatWithCounsellor = async (req, res) => {
       ? shortlist.map(s => `${s.uni_name} (${s.category})`).join(', ')
       : 'None';
 
+
     // Process tasks (Optimize: summary only, not full list)
     const tasks = tasksResult || [];
     user.tasks = tasks; // Attach for tools
@@ -614,19 +704,23 @@ const streamChatWithCounsellor = async (req, res) => {
     const totalTasks = tasks.length;
     const taskProgress = totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : 0;
 
+
     // Only list high priority pending tasks to save tokens
     const pendingHighPriority = tasks
       .filter(t => t.status === 'pending' && t.priority === 'high')
       .map(t => t.title)
       .slice(0, 5); // Max 5 tasks
 
+
     // Build concise context strings
     const shortlistContext = `Shortlist: ${shortlistSummary}${lockedUni ? `. Locked: ${lockedUni.uni_name}` : ''}`;
+
 
     let taskContext = `Tasks: ${completedTasks}/${totalTasks} done (${taskProgress}%).`;
     if (pendingHighPriority.length > 0) {
       taskContext += ` Priority: ${pendingHighPriority.join(', ')}`;
     }
+
 
     // Build profile text (Concise version)
     const profile = user.profile_data || {};
@@ -638,7 +732,8 @@ const streamChatWithCounsellor = async (req, res) => {
       ${taskContext}
     `;
 
-    // Define tools (kept same)
+
+    // Define tools
     const tools = [
       {
         type: "function",
@@ -680,7 +775,12 @@ const streamChatWithCounsellor = async (req, res) => {
         function: {
           name: "get_university_recommendations",
           description: "Generate fresh personalized university recommendations",
-          parameters: { type: "object", properties: {} }
+          parameters: {
+            type: "object",
+            properties: {
+              reason: { type: "string", description: "Reason for generating recommendations (optional)" }
+            }
+          }
         }
       },
       {
@@ -738,114 +838,221 @@ const streamChatWithCounsellor = async (req, res) => {
       }
     ];
 
+
     // OPTIMIZATION: Limit history to last 10 messages instead of 20
     const history = conversation.messages || [];
     const recentHistory = history.slice(-10);
 
+
     const messages = [
       {
         role: "system",
-        content: `You are an expert Study Abroad Counsellor.
-        
-        Role:
-        - Provide realistic, honest advice.
-        - Be strict if profile is weak.
-        - Use tools to Take Actions (Shortlist, Add Task, Update Profile).
-        
+        content: `You are an expert Study Abroad Counsellor with access to tools for taking actions.
+       
         Context:
         ${profileContext}
-        
-        Tools:
-        - shortlist_university: Add to list
-        - add_task: Create new task
-        - set_task_status: Mark task done/pending
-        - get_university_recommendations: Get suggestions
-        - lock_university: Lock final choice
-        - update_profile: Update user data
-        
-        Be concise. Use headers/bullets.`
+       
+        CRITICAL RULES:
+        1. You have tools available - use them when appropriate
+        2. NEVER write function calls as text (e.g., "<function=...", "tool_name(...)")
+        3. NEVER mention tool names in your response text
+        4. When you need to take an action, use the tool directly - the system handles it automatically
+        5. Provide conversational responses alongside tool usage
+       
+        Guidelines:
+        - Be realistic and honest about admissions chances
+        - Be strict if profile doesn't match aspirations
+        - Use concise, structured responses (headers/bullets)
+        - Explain your reasoning clearly`
       },
       ...recentHistory.map(msg => ({ role: msg.role, content: msg.content })),
       { role: "user", content: message }
     ];
 
+
     // Save user message immediately
     // We don't await this to speed up initial response
     Conversation.addMessage(conversation.id, "user", message).catch(err => console.error("Error saving user msg:", err));
 
+
     // Send conversation ID immediately
     res.write(`data: ${JSON.stringify({ type: 'start', conversation_id: conversation.id })}\n\n`);
 
+
+    console.log(`[AI Stream] Starting chat for user ${user.id}, conversation ${conversation.id}`);
     console.time("Groq Stream");
 
-    // TRUE STREAMING CALL
-    const stream = await groq.chat.completions.create({
-      messages,
-      model: "llama-3.1-8b-instant",
-      tools,
-      tool_choice: "auto",
-      temperature: 0.7,
-      stream: true // Enable streaming
-    });
+
+    // TRUE STREAMING CALL with error handling
+    let stream;
+    try {
+      stream = await groq.chat.completions.create({
+        messages,
+        model: "llama-3.1-8b-instant",
+        tools,
+        tool_choice: "auto",
+        temperature: 0.7,
+        max_tokens: 2000, // Ensure enough tokens for complete tool calls
+        stream: true // Enable streaming
+      });
+    } catch (streamError) {
+      console.error("❌ [AI Stream] Failed to create Groq stream:", streamError.message);
+      throw new Error(`Groq API error: ${streamError.message}`);
+    }
+
 
     let fullContent = "";
     let toolCalls = [];
     let currentToolCall = null;
+    let streamError = null;
 
-    for await (const chunk of stream) {
-      const delta = chunk.choices[0]?.delta;
 
-      // Handle Content
-      if (delta?.content) {
-        fullContent += delta.content;
-        // Stream content chunk directly to client
-        res.write(`data: ${JSON.stringify({ type: 'chunk', content: delta.content })}\n\n`);
-      }
+    try {
+      for await (const chunk of stream) {
+        const delta = chunk.choices[0]?.delta;
 
-      // Handle Tool Calls (Accumulate)
-      if (delta?.tool_calls) {
-        for (const toolCallChunk of delta.tool_calls) {
-          if (toolCallChunk.id) {
-            // New tool call starting
-            if (currentToolCall) {
-              toolCalls.push(currentToolCall);
-            }
-            currentToolCall = {
-              id: toolCallChunk.id,
-              name: toolCallChunk.function?.name || "",
-              args: toolCallChunk.function?.arguments || ""
-            };
-          } else if (currentToolCall) {
-            // Continuing existing tool call
-            if (toolCallChunk.function?.name) {
-              currentToolCall.name += toolCallChunk.function.name;
-            }
-            if (toolCallChunk.function?.arguments) {
-              currentToolCall.args += toolCallChunk.function.arguments;
+        // Check for finish reason that might indicate issues
+        const finishReason = chunk.choices[0]?.finish_reason;
+        if (finishReason === 'length') {
+          console.warn("Stream finished due to length limit - tool calls may be incomplete");
+        }
+
+
+        // Handle Content
+        if (delta?.content) {
+          // Filter out any text-based function calls that might leak through
+          let cleanContent = delta.content;
+
+          // Remove patterns like <function=...> or tool_name(...)
+          cleanContent = cleanContent.replace(/<function=[^>]*>/g, '');
+          cleanContent = cleanContent.replace(/\b(shortlist_university|add_task|get_university_recommendations|lock_university|update_profile|set_task_status)\s*\([^)]*\)/g, '');
+
+          if (cleanContent) {
+            fullContent += cleanContent;
+            // Stream content chunk directly to client
+            res.write(`data: ${JSON.stringify({ type: 'chunk', content: cleanContent })}\n\n`);
+          }
+        }
+
+
+        // Handle Tool Calls (Accumulate)
+        if (delta?.tool_calls) {
+          for (const toolCallChunk of delta.tool_calls) {
+            if (toolCallChunk.id) {
+              // New tool call starting
+              if (currentToolCall) {
+                toolCalls.push(currentToolCall);
+              }
+              currentToolCall = {
+                id: toolCallChunk.id,
+                name: toolCallChunk.function?.name || "",
+                args: toolCallChunk.function?.arguments || ""
+              };
+            } else if (currentToolCall) {
+              // Continuing existing tool call
+              if (toolCallChunk.function?.name) {
+                currentToolCall.name += toolCallChunk.function.name;
+              }
+              if (toolCallChunk.function?.arguments) {
+                currentToolCall.args += toolCallChunk.function.arguments;
+              }
             }
           }
         }
       }
+    } catch (streamIterError) {
+      console.error("Error during stream iteration:", streamIterError);
+      streamError = streamIterError;
+
+      // Check if this is a tool_use_failed error with failed_generation
+      if (streamIterError.error?.code === 'tool_use_failed' && streamIterError.error?.failed_generation) {
+        const failedGen = streamIterError.error.failed_generation;
+        console.log("Attempting to parse failed_generation:", failedGen);
+
+        // Parse the malformed function call format: <function=name>{"args"}<function>
+        // Use a more robust regex that captures everything between > and the closing <function>
+        const funcMatch = failedGen.match(/<function=(\w+)>(.+?)(?:<function>|<\/function>|$)/s);
+        if (funcMatch) {
+          const funcName = funcMatch[1];
+          let funcArgs = funcMatch[2].trim();
+
+          // Clean up any trailing angle bracket fragments
+          funcArgs = funcArgs.replace(/<\/?function>?$/g, '').trim();
+
+          console.log(`Recovered tool call from failed_generation: ${funcName}`, funcArgs);
+
+          // Add this as a tool call to be executed
+          toolCalls.push({
+            id: `recovered_${Date.now()}`,
+            name: funcName,
+            args: funcArgs
+          });
+        }
+      }
+      // Continue to process any accumulated data
     }
 
-    // Push the last tool call if exists
+
+    // Push the last tool call if exists and is valid
     if (currentToolCall) {
-      toolCalls.push(currentToolCall);
+      // Validate the tool call is complete
+      if (currentToolCall.name && currentToolCall.args) {
+        // Check if args looks like valid JSON (at least has opening brace)
+        if (currentToolCall.args.trim().startsWith('{')) {
+          toolCalls.push(currentToolCall);
+        } else {
+          console.warn("Discarding incomplete tool call:", currentToolCall);
+        }
+      } else {
+        console.warn("Discarding invalid tool call:", currentToolCall);
+      }
     }
+
 
     console.timeEnd("Groq Stream");
+
+    // Log any stream errors but continue processing
+    if (streamError) {
+      console.error("Stream completed with error, but processing accumulated data");
+    }
+
 
     // Execute Tool Calls if any
     const actions = [];
     if (toolCalls.length > 0) {
       console.log(`Executing ${toolCalls.length} tool calls...`);
 
+
       for (const tc of toolCalls) {
         try {
           const functionName = tc.name;
-          const functionArgs = JSON.parse(tc.args);
+
+          // Validate tool call has complete data
+          if (!functionName || !tc.args) {
+            console.warn("Incomplete tool call detected:", tc);
+            continue;
+          }
+
+          // Validate JSON is complete and parseable
+          let functionArgs;
+          try {
+            functionArgs = JSON.parse(tc.args);
+          } catch (parseError) {
+            console.error("Failed to parse tool arguments:", tc.args, parseError);
+            // Try to recover by adding closing braces
+            try {
+              const fixedArgs = tc.args + '}';
+              functionArgs = JSON.parse(fixedArgs);
+              console.log("Recovered malformed JSON with closing brace");
+            } catch (recoveryError) {
+              console.error("Could not recover malformed JSON, skipping tool call");
+              continue;
+            }
+          }
+
           let result;
           let actionData;
+
 
           switch (functionName) {
             case "shortlist_university":
@@ -858,6 +1065,7 @@ const streamChatWithCounsellor = async (req, res) => {
               };
               break;
 
+
             case "add_task":
               result = await executeAddTask(user.id, functionArgs);
               actionData = {
@@ -866,6 +1074,7 @@ const streamChatWithCounsellor = async (req, res) => {
                 success: result.success
               };
               break;
+
 
             case "get_university_recommendations":
               result = await executeGetRecommendations(user);
@@ -877,6 +1086,7 @@ const streamChatWithCounsellor = async (req, res) => {
               };
               break;
 
+
             case "lock_university":
               result = await executeLockUniversity(user.id, functionArgs, shortlist);
               actionData = {
@@ -885,6 +1095,7 @@ const streamChatWithCounsellor = async (req, res) => {
                 success: result.success
               };
               break;
+
 
             case "update_profile":
               result = await executeUpdateProfile(user.id, user.profile_data || {}, functionArgs);
@@ -895,6 +1106,7 @@ const streamChatWithCounsellor = async (req, res) => {
                 success: result.success
               };
               break;
+
 
             case "set_task_status":
               result = await executeUpdateTask(user.id, functionArgs, tasks);
@@ -907,20 +1119,24 @@ const streamChatWithCounsellor = async (req, res) => {
               break;
           }
 
+
           if (actionData) {
             actions.push(actionData);
             // Stream action to client immediately
             res.write(`data: ${JSON.stringify({ type: 'action', ...actionData })}\n\n`);
           }
 
+
         } catch (e) {
           console.error("Tool execution error:", e);
         }
       }
 
+
       // If we had tool calls but no content, we might want to generate a follow-up summary
       // If we had tool calls but no content, we MUST generate a follow-up summary
       if (!fullContent && actions.length > 0) {
+
 
         // Construct the assistant message that just happened
         const assistantMessage = {
@@ -933,6 +1149,7 @@ const streamChatWithCounsellor = async (req, res) => {
           }))
         };
 
+
         const toolResultMessages = [
           ...messages,
           assistantMessage,
@@ -943,6 +1160,7 @@ const streamChatWithCounsellor = async (req, res) => {
           }))
         ];
 
+
         try {
           const followUp = await groq.chat.completions.create({
             messages: toolResultMessages,
@@ -950,6 +1168,7 @@ const streamChatWithCounsellor = async (req, res) => {
             temperature: 0.7,
             stream: true
           });
+
 
           for await (const chunk of followUp) {
             const content = chunk.choices[0]?.delta?.content || '';
@@ -967,10 +1186,12 @@ const streamChatWithCounsellor = async (req, res) => {
       }
     }
 
+
     // Save assistant response
     if (fullContent) {
       Conversation.addMessage(conversation.id, "assistant", fullContent).catch(e => console.error("Error saving specific msg", e));
     }
+
 
     // Done signal
     res.write(`data: ${JSON.stringify({
@@ -981,6 +1202,7 @@ const streamChatWithCounsellor = async (req, res) => {
     })}\n\n`);
     res.end();
 
+
   } catch (err) {
     console.error("Stream chat error:", err);
     if (!res.writableEnded) {
@@ -990,11 +1212,13 @@ const streamChatWithCounsellor = async (req, res) => {
   }
 };
 
+
 // @desc    Get all conversations for user
 // @route   GET /api/ai/conversations
 const getConversations = async (req, res) => {
   try {
     const conversations = await Conversation.findAllByUser(req.user.id);
+
 
     // Return with preview of first message
     const formatted = conversations.map(conv => ({
@@ -1005,12 +1229,14 @@ const getConversations = async (req, res) => {
       created_at: conv.created_at
     }));
 
+
     res.json({ conversations: formatted });
   } catch (err) {
     console.error("Get conversations error:", err);
     res.status(500).json({ error: 'Server Error' });
   }
 };
+
 
 // @desc    Create new conversation
 // @route   POST /api/ai/conversations/new
@@ -1027,6 +1253,7 @@ const createConversation = async (req, res) => {
   }
 };
 
+
 // @desc    Delete conversation
 // @route   DELETE /api/ai/conversations/:id
 const deleteConversation = async (req, res) => {
@@ -1034,9 +1261,11 @@ const deleteConversation = async (req, res) => {
     const { id } = req.params;
     const deleted = await Conversation.delete(id, req.user.id);
 
+
     if (!deleted) {
       return res.status(404).json({ error: "Conversation not found" });
     }
+
 
     res.json({ message: "Conversation deleted" });
   } catch (err) {
@@ -1045,12 +1274,14 @@ const deleteConversation = async (req, res) => {
   }
 };
 
+
 // @desc    Load specific conversation
 // @route   GET /api/ai/conversations/:id
 const loadConversation = async (req, res) => {
   try {
     const { id } = req.params;
     const history = await Conversation.getHistory(id);
+
 
     res.json({
       conversation_id: id,
@@ -1061,6 +1292,7 @@ const loadConversation = async (req, res) => {
     res.status(500).json({ error: 'Server Error' });
   }
 };
+
 
 module.exports = {
   chatWithCounsellor,
