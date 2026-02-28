@@ -203,6 +203,10 @@ const chatWithCounsellor = async (req, res) => {
        
         VALUE NORMALIZATION:
         - If user provides a number with 'k' suffix (e.g., '85k', '50k'), ALWAYS convert it to thousands (e.g., '85000', '50000') before calling tools.
+
+        RESTRICTIONS:
+        - If the user says "thanks", "thank you", "bye", or other closing/polite remarks, do NOT call any tools. Just respond politely.
+        - Do not generate recommendations unless explicitly asked or if the user's list is empty.
        
         Be conversational but professional. Use the user's name occasionally.`
       },
@@ -213,6 +217,23 @@ const chatWithCounsellor = async (req, res) => {
       { role: "user", content: message }
     ];
 
+
+    // Check for small talk to skip tool usage
+    const isSmallTalk = /^(thanks?|thank\s?you|thx|tysm|hi|hello|hey|ok|okay|bye|goodbye|cool|wow|great|cheers|excellent|sure)[\s!.?]*$/i.test(message.trim());
+
+    // HARDCODED RESPONSE FOR SMALL TALK
+    if (isSmallTalk) {
+      const hardcodedReply = "You're welcome! Feel free to ask if you need help with anything else.";
+      await Conversation.addMessage(conversation.id, "user", message);
+      await Conversation.addMessage(conversation.id, "assistant", hardcodedReply);
+
+      return res.json({
+        reply: hardcodedReply,
+        actions: [],
+        conversation_id: conversation.id,
+        has_actions: false
+      });
+    }
 
     // Call Groq with function calling
     const completion = await groq.chat.completions.create({
@@ -680,11 +701,40 @@ const streamChatWithCounsellor = async (req, res) => {
     // OPTIMIZED: Reduce parallel fetching load
     // We only fetch what is strictly necessary for the prompt
     console.time("Context Fetch");
-    const [conversation, shortlistResult, tasksResult] = await Promise.all([
-      Conversation.getOrCreate(user.id),
-      Shortlist.findAllByUser(user.id),
-      Task.findAllByUser(user.id)
-    ]);
+
+    // Logic to get correct conversation
+    // Logic to get correct conversation
+    let conversationPromise;
+    // Validate ID fits in Postgres integer (max 2147483647)
+    // Client might send timestamp (e.g. 1769821713142) which overflows INTEGER
+    const validId = conversation_id &&
+      !isNaN(Number(conversation_id)) &&
+      Number(conversation_id) < 2147483647;
+
+    if (validId) {
+      // If ID provided and valid, try to fetch it specifically
+      conversationPromise = pool.query('SELECT * FROM conversations WHERE id = $1 AND user_id = $2', [conversation_id, user.id])
+        .then(res => res.rows[0] || Conversation.getOrCreate(user.id)); // Fallback if not found
+    } else {
+      conversationPromise = Conversation.getOrCreate(user.id);
+    }
+
+    // 1. Get Conversation First (Required for all flows)
+    const conversation = await conversationPromise;
+
+    // 2. Check Small Talk Early to optimize queries
+    const isSmallTalk = /^(thanks?|thank\s?you|thx|tysm|hi|hello|hey|ok|okay|bye|goodbye|cool|wow|great|cheers|excellent|sure)[\s!.?]*$/i.test(message.trim());
+
+    // 3. Fetch remaining context ONLY if not small talk
+    let shortlistResult = [];
+    let tasksResult = [];
+
+    if (!isSmallTalk) {
+      [shortlistResult, tasksResult] = await Promise.all([
+        Shortlist.findAllByUser(user.id),
+        Task.findAllByUser(user.id)
+      ]);
+    }
     console.timeEnd("Context Fetch");
 
 
@@ -863,7 +913,8 @@ const streamChatWithCounsellor = async (req, res) => {
         - Be realistic and honest about admissions chances
         - Be strict if profile doesn't match aspirations
         - Use concise, structured responses (headers/bullets)
-        - Explain your reasoning clearly`
+        - Explain your reasoning clearly
+        - Do NOT call tools for simple greetings, "thanks", "ok", or closing remarks. Just reply normally.`
       },
       ...recentHistory.map(msg => ({ role: msg.role, content: msg.content })),
       { role: "user", content: message }
@@ -882,6 +933,32 @@ const streamChatWithCounsellor = async (req, res) => {
     console.log(`[AI Stream] Starting chat for user ${user.id}, conversation ${conversation.id}`);
     console.time("Groq Stream");
 
+
+    // Check for small talk to skip tool usage
+    // Check for small talk to skip tool usage
+    // const isSmallTalk already defined above
+    // const toolChoice = isSmallTalk ? "none" : "auto"; // Not needed as we use hardcoded response
+
+    if (isSmallTalk) {
+      console.log(`[AI Stream] Detected small talk ("${message}"), using hardcoded response.`);
+      const hardcodedReply = "You're welcome! Feel free to ask if you need help with anything else.";
+
+      // Save full message exchange
+      Conversation.addMessage(conversation.id, "assistant", hardcodedReply);
+
+      // Stream response to client simulating AI typing
+      res.write(`data: ${JSON.stringify({ type: 'chunk', content: hardcodedReply })}\n\n`);
+      res.write(`data: ${JSON.stringify({
+        type: 'done',
+        full_content: hardcodedReply,
+        actions: [],
+        has_actions: false
+      })}\n\n`);
+      res.end();
+      return;
+    }
+
+    // TRUE STREAMING CALL with error handling
 
     // TRUE STREAMING CALL with error handling
     let stream;
